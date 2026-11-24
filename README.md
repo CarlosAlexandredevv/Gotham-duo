@@ -22,25 +22,25 @@ The goal is local co-op only. The game has no online or LAN co-op, and this proj
 
 ## Status
 
-**Early prototype (Steam D3D12 validated).** Core dual-monitor capture and presentation are working on Steam (`3840x1080` split to two `1920x1080` monitors); two-controller co-op gameplay, menu polish, and Epic Games Store remain to be tested.
+**Early prototype (Steam D3D12 validated).** Core Solo/Duo switching and dual-monitor capture/presentation are working on Steam (`1920x1080` Solo on the primary monitor, switching to `3840x1080` split across two `1920x1080` monitors in Duo mode); two-controller co-op gameplay, menu polish, and Epic Games Store remain to be tested.
 
 - [x] Proof of concept: hook the game's `Present` call and log frame info
 - [x] Capture the backbuffer and split it into left/right halves
 - [x] Create one borderless window per monitor with its own swapchain
 - [x] Present each half on the correct monitor
+- [x] Automatic Solo/Duo mode switching (starts in Solo; switches to Duo on P2 `Start` or `F9`, returns to Solo on `Back + Start` hold or `F9`)
 - [ ] Suppress the original presentation to avoid duplicates
-- [ ] Config file (monitor selection via `gothamduo.ini` works; resolution and hotkeys config pending)
-- [ ] Handle menus, pause screen and the shared-camera case (`F9` currently toggles the split windows)
+- [ ] Config file (monitor selection and input triggers via `gothamduo.ini` work; full hotkey/resolution config pending)
+- [ ] Handle menus, pause screen and the shared-camera case (`F9` or holding `Back + Start` on Controller 2 returns to Solo mode)
 - [ ] Test on Steam (2-controller co-op) and Epic versions
 
 ## How it works
 
-The game runs one instance and draws a vertical split screen (player 1 on the left, player 2 on the right) into a single window. Gotham Duo does not try to render a second camera. Instead it:
+The game runs one instance and draws a vertical split screen (player 1 on the left, player 2 on the right) into a single window when two players are active. Gotham Duo does not try to render a second camera. Instead it hooks DXGI (`CreateSwapChainForHwnd`, `Present`, `Present1`, `ResizeBuffers`) via a `version.dll` proxy and manages two runtime modes:
 
-1. Resizes the game window across the combined width of both target monitors (for example `3840x1080`), so each half is a full `1920x1080` view.
-2. Hooks DXGI (`CreateSwapChainForHwnd`, `Present`, `Present1`, `ResizeBuffers`) via a `version.dll` proxy.
-3. Copies the left half of the D3D12 backbuffer to a borderless window on monitor 1 and the right half to monitor 2 using `CopyTextureRegion`.
-4. Forwards focus back to the game window when clicking either output monitor.
+1. **Solo mode (default at launch):** Keeps the game on the primary monitor (`1920x1080` borderless/fullscreen) with the extra output windows hidden and zero overlay/copy overhead.
+2. **Duo mode (on Player 2 `Start` or `F9`):** Resizes the game window across the combined width of both target monitors (for example `3840x1080`) so each half is a full `1920x1080` view, creates per-monitor borderless output windows, copies the left half of the D3D12 backbuffer to monitor 1 and the right half to monitor 2 using `CopyTextureRegion`, and forwards focus back to the game window when clicking either output monitor.
+3. **Returning to Solo mode (`Back + Start` held for 800 ms on Controller 2, or `F9`):** Releases the extra D3D12 swapchains, hides the output windows, and restores the game window to the primary monitor.
 
 ## Requirements (planned)
 
@@ -80,13 +80,14 @@ Dependencies:
 ## Installation
 
 1. Build or download `version.dll` (and optionally [config/gothamduo.ini](config/gothamduo.ini)).
-2. Copy `version.dll` (and `gothamduo.ini` if customizing monitors) next to the shipping executable:
+2. Copy `version.dll` (and `gothamduo.ini` if customizing monitors or controller triggers) next to the shipping executable:
    `LEGOBatmanLotDK\Binaries\Win64\` (alongside `LEGOBatmanLotDK-Win64-Shipping.exe`, **not** the root launcher folder).
-3. Launch the game (Windowed or Borderless mode is recommended) and enable co-op by pressing Start on the second controller.
-4. Hotkeys:
-   - `F9`: Toggle the dual-monitor output windows on/off.
-   - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080`).
-5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`.
+3. Launch the game (Windowed or Borderless mode is recommended). It starts in **Solo mode** on the primary monitor (`1920x1080`).
+4. Switching modes:
+   - **Solo → Duo:** Press `Start` on Controller 2 (auto-detected) or press `F9`.
+   - **Duo → Solo:** Hold `Back + Start` on Controller 2 for `800 ms` (configurable) or press `F9`.
+   - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080`) while in Duo mode.
+5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`).
 
 ## Known limitations (expected)
 
