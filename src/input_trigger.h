@@ -8,7 +8,9 @@ namespace gotham {
 
 struct InputConfig {
     bool allow_controller = true;
+    /// Controller slot index (0..3) for P2; -1 or any value outside 0..3 monitors slots 1..3.
     int p2_controller_index = -1;
+    /// Duration (ms) Back + Start must be held together in Duo mode to exit to Solo.
     uint32_t hold_back_start_ms = 800;
 };
 
@@ -27,7 +29,13 @@ enum class TriggerAction {
 /// Pure state machine translating F9 and controller inputs into Solo/Duo mode transitions.
 class InputTrigger {
 public:
-    void SetConfig(const InputConfig& config) { config_ = config; }
+    void SetConfig(InputConfig config) {
+        if (config.p2_controller_index != config_.p2_controller_index) {
+            combo_hold_start_ms_.fill(std::nullopt);
+            wait_release_after_exit_.fill(false);
+        }
+        config_ = config;
+    }
     const InputConfig& config() const { return config_; }
 
     /// Evaluates one input poll tick and returns any resulting mode transition.
@@ -37,6 +45,9 @@ public:
                          uint64_t now_ms);
 
 private:
+    void SyncStartAndResetCombos(const std::array<ControllerButtons, 4>& slots,
+                                 bool clear_wait_release);
+
     InputConfig config_{};
     bool prev_f9_down_ = false;
     std::array<bool, 4> prev_start_down_{};

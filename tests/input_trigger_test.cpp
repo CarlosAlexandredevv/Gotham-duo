@@ -98,6 +98,15 @@ void TestHoldBackStartExitsDuoAfter800Ms() {
     CHECK(trigger.Update(true, false, slots, 3600) == TriggerAction::None);
     CHECK(trigger.Update(true, false, slots, 4399) == TriggerAction::None);
     CHECK(trigger.Update(true, false, slots, 4400) == TriggerAction::ToggleToSolo);
+
+    // Non-monotonic timestamp (now_ms stepping backwards) resets hold start without underflow.
+    slots[1] = {true, false, false};
+    CHECK(trigger.Update(false, false, slots, 5000) == TriggerAction::None);
+    slots[1] = {true, true, true};
+    CHECK(trigger.Update(true, false, slots, 5000) == TriggerAction::None);
+    CHECK(trigger.Update(true, false, slots, 4900) == TriggerAction::None);
+    CHECK(trigger.Update(true, false, slots, 5699) == TriggerAction::None);
+    CHECK(trigger.Update(true, false, slots, 5700) == TriggerAction::ToggleToSolo);
 }
 
 void TestDisabledControllerAndExplicitSlot() {
@@ -111,7 +120,16 @@ void TestDisabledControllerAndExplicitSlot() {
     slots[1] = {true, true, false};
     CHECK(trigger.Update(false, false, slots, 100) == TriggerAction::None);
 
+    // Re-enabling allow_controller while Start is already held must not fire a spurious edge.
+    cfg.allow_controller = true;
+    trigger.SetConfig(cfg);
+    CHECK(trigger.Update(false, false, slots, 105) == TriggerAction::None);
+    slots[1].start = false;
+    CHECK(trigger.Update(false, false, slots, 106) == TriggerAction::None);
+
     // F9 still works even when allow_controller is false.
+    cfg.allow_controller = false;
+    trigger.SetConfig(cfg);
     CHECK(trigger.Update(false, true, slots, 110) == TriggerAction::ToggleToDuo);
     CHECK(trigger.Update(true, false, slots, 120) == TriggerAction::None);
 

@@ -5,6 +5,17 @@
 
 namespace gotham {
 
+void InputTrigger::SyncStartAndResetCombos(const std::array<ControllerButtons, 4>& slots,
+                                           bool clear_wait_release) {
+    combo_hold_start_ms_.fill(std::nullopt);
+    if (clear_wait_release) {
+        wait_release_after_exit_.fill(false);
+    }
+    for (size_t i = 0; i < slots.size(); ++i) {
+        prev_start_down_[i] = slots[i].connected && slots[i].start;
+    }
+}
+
 TriggerAction InputTrigger::Update(bool is_duo,
                                    bool f9_down,
                                    const std::array<ControllerButtons, 4>& slots,
@@ -12,14 +23,12 @@ TriggerAction InputTrigger::Update(bool is_duo,
     const bool f9_rising = f9_down && !prev_f9_down_;
     prev_f9_down_ = f9_down;
     if (f9_rising) {
-        combo_hold_start_ms_.fill(std::nullopt);
-        for (size_t i = 0; i < slots.size(); ++i) {
-            prev_start_down_[i] = slots[i].connected && slots[i].start;
-        }
+        SyncStartAndResetCombos(slots, false);
         return is_duo ? TriggerAction::ToggleToSolo : TriggerAction::ToggleToDuo;
     }
 
     if (!config_.allow_controller) {
+        SyncStartAndResetCombos(slots, true);
         return TriggerAction::None;
     }
 
@@ -59,7 +68,7 @@ TriggerAction InputTrigger::Update(bool is_duo,
         }
 
         if (s.start && s.back) {
-            if (!combo_hold_start_ms_[i].has_value()) {
+            if (!combo_hold_start_ms_[i].has_value() || now_ms < *combo_hold_start_ms_[i]) {
                 combo_hold_start_ms_[i] = now_ms;
             }
             if (now_ms - *combo_hold_start_ms_[i] >= config_.hold_back_start_ms) {
