@@ -23,6 +23,7 @@ add_library(gothamduo SHARED
     src/dllmain.cpp
     src/dual_output.cpp
     src/dxgi_hook.cpp
+    src/input_trigger.cpp
     src/version_proxy.cpp
     src/version_trampolines.asm
     src/version.def
@@ -47,3 +48,31 @@ target_link_libraries(gothamduo PRIVATE
     dxgi
     user32
 )
+
+enable_testing()
+
+add_executable(gothamduo_tests
+    tests/input_trigger_test.cpp
+    src/input_trigger.cpp
+)
+
+set_target_properties(gothamduo_tests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+target_include_directories(gothamduo_tests PRIVATE
+    src
+)
+
+target_compile_definitions(gothamduo_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    UNICODE
+    _UNICODE
+)
+
+target_link_libraries(gothamduo_tests PRIVATE
+    user32
+)
+
+add_test(NAME input_trigger_tests COMMAND gothamduo_tests)
