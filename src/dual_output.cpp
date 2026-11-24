@@ -1,10 +1,12 @@
 #include "dual_output.h"
+#include "input_trigger.h"
 #include "log.h"
 
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <vector>
@@ -19,6 +21,8 @@ constexpr UINT kFrameSlots = 3;
 constexpr UINT kOutputBuffers = 3;
 constexpr UINT kMsgSetVisible = WM_APP + 1;
 
+enum class OutputMode { Solo, Duo };
+
 struct MonitorDesc {
     RECT rect{};
     bool primary = false;
@@ -27,6 +31,29 @@ struct MonitorDesc {
     LONG width() const { return rect.right - rect.left; }
     LONG height() const { return rect.bottom - rect.top; }
 };
+
+void BuildIniPath(HMODULE self_module, wchar_t (&out_path)[MAX_PATH]) {
+    out_path[0] = L'\0';
+    GetModuleFileNameW(self_module, out_path, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(out_path, L'\\')) {
+        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - out_path), L"gothamduo.ini");
+    }
+}
+
+InputConfig LoadInputConfig(HMODULE self_module) {
+    wchar_t ini_path[MAX_PATH] = {};
+    BuildIniPath(self_module, ini_path);
+
+    InputConfig cfg{};
+    cfg.allow_controller =
+        GetPrivateProfileIntW(L"Input", L"AllowControllerToggle", 1, ini_path) != 0;
+    cfg.p2_controller_index = static_cast<int>(
+        GetPrivateProfileIntW(L"Input", L"P2ControllerIndex", -1, ini_path));
+    const int hold_ms = static_cast<int>(
+        GetPrivateProfileIntW(L"Input", L"HoldBackStartMs", 800, ini_path));
+    cfg.hold_back_start_ms = static_cast<uint32_t>(hold_ms <= 0 ? 800 : hold_ms);
+    return cfg;
+}
 
 BOOL CALLBACK EnumMonitorProc(HMONITOR hmon, HDC, LPRECT, LPARAM lparam) {
     auto* list = reinterpret_cast<std::vector<MonitorDesc>*>(lparam);
@@ -61,6 +88,7 @@ std::vector<MonitorDesc> QueryMonitors() {
 
 bool SelectTargetMonitors(HMODULE self_module,
                           const std::vector<MonitorDesc>& monitors,
+                          MonitorDesc& out_solo,
                           MonitorDesc& out_p1,
                           MonitorDesc& out_p2) {
     if (monitors.size() < 2) {
@@ -69,10 +97,7 @@ bool SelectTargetMonitors(HMODULE self_module,
     }
 
     wchar_t ini_path[MAX_PATH] = {};
-    GetModuleFileNameW(self_module, ini_path, MAX_PATH);
-    if (wchar_t* slash = wcsrchr(ini_path, L'\\')) {
-        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - ini_path), L"gothamduo.ini");
-    }
+    BuildIniPath(self_module, ini_path);
 
     const int cfg_p1 = GetPrivateProfileIntW(L"Monitors", L"Player1", -1, ini_path);
     const int cfg_p2 = GetPrivateProfileIntW(L"Monitors", L"Player2", -1, ini_path);
@@ -83,34 +108,41 @@ bool SelectTargetMonitors(HMODULE self_module,
         out_p2 = monitors[cfg_p2];
         Log("Using gothamduo.ini monitors: Player1=%d (%ls), Player2=%d (%ls)",
             cfg_p1, out_p1.device, cfg_p2, out_p2.device);
-        return true;
-    }
-
-    // Auto-select landscape monitors ordered left-to-right so left half sits on the left monitor.
-    std::vector<size_t> candidates;
-    for (size_t i = 0; i < monitors.size(); ++i) {
-        if (monitors[i].width() >= monitors[i].height()) {
-            candidates.push_back(i);
-        }
-    }
-    if (candidates.size() < 2) {
-        candidates.clear();
+    } else {
+        // Auto-select landscape monitors ordered left-to-right so left half sits on the left monitor.
+        std::vector<size_t> candidates;
         for (size_t i = 0; i < monitors.size(); ++i) {
-            candidates.push_back(i);
+            if (monitors[i].width() >= monitors[i].height()) {
+                candidates.push_back(i);
+            }
         }
+        if (candidates.size() < 2) {
+            candidates.clear();
+            for (size_t i = 0; i < monitors.size(); ++i) {
+                candidates.push_back(i);
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
+            if (monitors[a].rect.left != monitors[b].rect.left) {
+                return monitors[a].rect.left < monitors[b].rect.left;
+            }
+            return monitors[a].rect.top < monitors[b].rect.top;
+        });
+
+        out_p1 = monitors[candidates[0]];
+        out_p2 = monitors[candidates[1]];
+        Log("Auto-selected monitors: Player1=%zu (%ls), Player2=%zu (%ls)",
+            candidates[0], out_p1.device, candidates[1], out_p2.device);
     }
 
-    std::sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
-        if (monitors[a].rect.left != monitors[b].rect.left) {
-            return monitors[a].rect.left < monitors[b].rect.left;
+    out_solo = out_p2;
+    for (const auto& m : monitors) {
+        if (m.primary) {
+            out_solo = m;
+            break;
         }
-        return monitors[a].rect.top < monitors[b].rect.top;
-    });
-
-    out_p1 = monitors[candidates[0]];
-    out_p2 = monitors[candidates[1]];
-    Log("Auto-selected monitors: Player1=%zu (%ls), Player2=%zu (%ls)",
-        candidates[0], out_p1.device, candidates[1], out_p2.device);
+    }
     return true;
 }
 
@@ -133,15 +165,21 @@ LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void ResizeGameWindowToDualSpan(HWND gh, const MonitorDesc& p1, const MonitorDesc& p2) {
+RECT ComputeDualSpanRect(const MonitorDesc& p1, const MonitorDesc& p2) {
+    const LONG left = (std::min)(p1.rect.left, p2.rect.left);
+    const LONG top = (std::min)(p1.rect.top, p2.rect.top);
+    const LONG width = p1.width() + p2.width();
+    const LONG height = (std::min)(p1.height(), p2.height());
+    return RECT{left, top, left + width, top + height};
+}
+
+void ResizeGameWindowToRect(HWND gh, const RECT& rect, const char* reason) {
     if (!gh || !IsWindow(gh)) {
         return;
     }
 
-    const int target_w = static_cast<int>(p1.width() + p2.width());
-    const int target_h = static_cast<int>((std::min)(p1.height(), p2.height()));
-    const int target_x = static_cast<int>((std::min)(p1.rect.left, p2.rect.left));
-    const int target_y = static_cast<int>((std::min)(p1.rect.top, p2.rect.top));
+    const int width = static_cast<int>(rect.right - rect.left);
+    const int height = static_cast<int>(rect.bottom - rect.top);
 
     LONG_PTR style = GetWindowLongPtrW(gh, GWL_STYLE);
     style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
@@ -150,25 +188,27 @@ void ResizeGameWindowToDualSpan(HWND gh, const MonitorDesc& p1, const MonitorDes
 
     SetWindowPos(gh,
                  nullptr,
-                 target_x,
-                 target_y,
-                 target_w,
-                 target_h,
+                 rect.left,
+                 rect.top,
+                 width,
+                 height,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING |
                      SWP_ASYNCWINDOWPOS);
 
-    Log("Requested game window span resize: hwnd=%p (%d,%d %dx%d)",
+    Log("Requested game window resize (%s): hwnd=%p (%ld,%ld %dx%d)",
+        reason ? reason : "",
         static_cast<void*>(gh),
-        target_x,
-        target_y,
-        target_w,
-        target_h);
+        rect.left,
+        rect.top,
+        width,
+        height);
 }
 
 }  // namespace
 
 struct DualOutput::Impl {
     HMODULE self_module = nullptr;
+    MonitorDesc mon_solo{};
     MonitorDesc mon_p1{};
     MonitorDesc mon_p2{};
     bool has_monitors = false;
@@ -183,8 +223,9 @@ struct DualOutput::Impl {
     bool init_failed = false;
     bool tearing_supported = false;
     bool logged_runtime_err = false;
-    bool tried_wide_resize = false;
-    std::atomic<bool> split_enabled{true};
+    bool pending_duo_resize = false;
+    std::atomic<OutputMode> mode{OutputMode::Solo};
+    InputTrigger input_trigger;
     std::atomic<HWND> game_hwnd{nullptr};
     std::atomic<ULONGLONG> last_present_ms{0};
     UINT src_width = 0;
@@ -229,11 +270,7 @@ struct DualOutput::Impl {
                                             nullptr,
                                             wc.hInstance,
                                             &self->game_hwnd);
-            if (self->hwnd[i]) {
-                ShowWindow(self->hwnd[i], SW_SHOWNOACTIVATE);
-                UpdateWindow(self->hwnd[i]);
-            }
-            Log("Created output window %d: hwnd=%p (%ld,%ld %ldx%ld)",
+            Log("Created output window %d (hidden): hwnd=%p (%ld,%ld %ldx%ld)",
                 i + 1,
                 static_cast<void*>(self->hwnd[i]),
                 targets[i]->rect.left,
@@ -247,7 +284,7 @@ struct DualOutput::Impl {
             SetTimer(self->hwnd[0], 1, 200, nullptr);
         }
 
-        bool currently_visible = true;
+        bool currently_visible = false;
         auto apply_visibility = [&](bool show) {
             if (show == currently_visible) {
                 return;
@@ -273,7 +310,7 @@ struct DualOutput::Impl {
                 const bool game_active =
                     (!gh || (IsWindow(gh) && IsWindowVisible(gh) && !IsIconic(gh))) &&
                     (last_ms == 0 || (GetTickCount64() - last_ms) < 1500);
-                apply_visibility(self->split_enabled.load() && game_active);
+                apply_visibility(self->mode.load() == OutputMode::Duo && game_active);
                 continue;
             }
             TranslateMessage(&msg);
@@ -436,12 +473,16 @@ void DualOutput::Start(HMODULE self_module) {
     }
     impl_ = new Impl();
     impl_->self_module = self_module;
+    impl_->input_trigger.SetConfig(LoadInputConfig(self_module));
 
     const auto monitors = QueryMonitors();
-    impl_->has_monitors = SelectTargetMonitors(self_module, monitors, impl_->mon_p1, impl_->mon_p2);
+    impl_->has_monitors =
+        SelectTargetMonitors(self_module, monitors, impl_->mon_solo, impl_->mon_p1, impl_->mon_p2);
     if (!impl_->has_monitors) {
         return;
     }
+
+    Log("Gotham Duo starting in SOLO mode (mon_solo=%ls)", impl_->mon_solo.device);
 
     impl_->windows_ready_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     impl_->win_thread = CreateThread(
@@ -451,7 +492,7 @@ void DualOutput::Start(HMODULE self_module) {
 void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
                               ID3D12CommandQueue* game_queue,
                               OrigPresentFn orig_present) {
-    if (!impl_ || !impl_->has_monitors || impl_->init_failed || !game_swapchain || !game_queue) {
+    if (!impl_ || !impl_->has_monitors || !game_swapchain || !game_queue) {
         return;
     }
 
@@ -468,29 +509,56 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         }
     }
 
-    if (GetAsyncKeyState(VK_F9) & 1) {
-        const bool next = !impl_->split_enabled.load();
-        impl_->split_enabled.store(next);
+    bool f9_down = false;
+    std::array<ControllerButtons, 4> slots{};
+    PollSystemInput(f9_down, slots);
+
+    const bool is_duo = impl_->mode.load() == OutputMode::Duo;
+    const TriggerAction action =
+        impl_->input_trigger.Update(is_duo, f9_down, slots, GetTickCount64());
+    if (action == TriggerAction::ToggleToDuo) {
+        impl_->mode.store(OutputMode::Duo);
+        impl_->pending_duo_resize = true;
+        Log("Mode switched to DUO");
+    } else if (action == TriggerAction::ToggleToSolo) {
+        impl_->mode.store(OutputMode::Solo);
+        impl_->pending_duo_resize = false;
         if (impl_->win_thread_id != 0) {
-            PostThreadMessageW(impl_->win_thread_id, kMsgSetVisible, next ? 1 : 0, 0);
+            PostThreadMessageW(impl_->win_thread_id, kMsgSetVisible, 0, 0);
         }
-        Log("DualOutput toggled via F9: %s", next ? "ON" : "OFF");
+        impl_->ReleaseD3D12();
+        impl_->init_failed = false;
+        ResizeGameWindowToRect(impl_->game_hwnd.load(), impl_->mon_solo.rect, "solo");
+        Log("Mode switched to SOLO");
     }
 
-    if (!impl_->split_enabled.load()) {
+    if (impl_->mode.load() != OutputMode::Duo || impl_->init_failed) {
         return;
+    }
+
+    if (impl_->pending_duo_resize) {
+        BOOL is_fullscreen = FALSE;
+        if (SUCCEEDED(game_swapchain->GetFullscreenState(&is_fullscreen, nullptr)) &&
+            is_fullscreen) {
+            game_swapchain->SetFullscreenState(FALSE, nullptr);
+            return;
+        }
+        impl_->pending_duo_resize = false;
+        const RECT span_rect = ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
+        ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo");
+        if (impl_->win_thread_id != 0) {
+            PostThreadMessageW(impl_->win_thread_id, kMsgSetVisible, 1, 0);
+        }
+    }
+
+    if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
+        const RECT span_rect = ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
+        ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo-manual");
     }
 
     DXGI_SWAP_CHAIN_DESC1 cur_desc{};
     if (FAILED(game_swapchain->GetDesc1(&cur_desc))) {
         return;
-    }
-
-    const UINT desired_w = static_cast<UINT>(impl_->mon_p1.width() + impl_->mon_p2.width());
-    const bool f10_pressed = (GetAsyncKeyState(VK_F10) & 1) != 0;
-    if (f10_pressed || (!impl_->tried_wide_resize && impl_->frame_index == 360 && cur_desc.Width != desired_w)) {
-        impl_->tried_wide_resize = true;
-        ResizeGameWindowToDualSpan(impl_->game_hwnd.load(), impl_->mon_p1, impl_->mon_p2);
     }
 
     if (impl_->pipeline_ready &&
