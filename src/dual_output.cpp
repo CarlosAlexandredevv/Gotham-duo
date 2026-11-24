@@ -9,6 +9,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <mutex>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -32,19 +34,30 @@ struct MonitorDesc {
     LONG height() const { return rect.bottom - rect.top; }
 };
 
-void BuildIniPath(HMODULE self_module, wchar_t (&out_path)[MAX_PATH]) {
+bool BuildIniPath(HMODULE self_module, wchar_t (&out_path)[MAX_PATH]) {
     out_path[0] = L'\0';
-    GetModuleFileNameW(self_module, out_path, MAX_PATH);
-    if (wchar_t* slash = wcsrchr(out_path, L'\\')) {
-        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - out_path), L"gothamduo.ini");
+    const DWORD len = GetModuleFileNameW(self_module, out_path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        out_path[0] = L'\0';
+        return false;
     }
+    wchar_t* slash = wcsrchr(out_path, L'\\');
+    if (!slash ||
+        (MAX_PATH - static_cast<size_t>(slash + 1 - out_path)) < _countof(L"gothamduo.ini")) {
+        out_path[0] = L'\0';
+        return false;
+    }
+    wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - out_path), L"gothamduo.ini");
+    return true;
 }
 
 InputConfig LoadInputConfig(HMODULE self_module) {
-    wchar_t ini_path[MAX_PATH] = {};
-    BuildIniPath(self_module, ini_path);
-
     InputConfig cfg{};
+    wchar_t ini_path[MAX_PATH] = {};
+    if (!BuildIniPath(self_module, ini_path)) {
+        return cfg;
+    }
+
     cfg.allow_controller =
         GetPrivateProfileIntW(L"Input", L"AllowControllerToggle", 1, ini_path) != 0;
     cfg.p2_controller_index = static_cast<int>(
@@ -97,10 +110,12 @@ bool SelectTargetMonitors(HMODULE self_module,
     }
 
     wchar_t ini_path[MAX_PATH] = {};
-    BuildIniPath(self_module, ini_path);
-
-    const int cfg_p1 = GetPrivateProfileIntW(L"Monitors", L"Player1", -1, ini_path);
-    const int cfg_p2 = GetPrivateProfileIntW(L"Monitors", L"Player2", -1, ini_path);
+    int cfg_p1 = -1;
+    int cfg_p2 = -1;
+    if (BuildIniPath(self_module, ini_path)) {
+        cfg_p1 = static_cast<int>(GetPrivateProfileIntW(L"Monitors", L"Player1", -1, ini_path));
+        cfg_p2 = static_cast<int>(GetPrivateProfileIntW(L"Monitors", L"Player2", -1, ini_path));
+    }
     if (cfg_p1 >= 0 && cfg_p2 >= 0 && cfg_p1 != cfg_p2 &&
         static_cast<size_t>(cfg_p1) < monitors.size() &&
         static_cast<size_t>(cfg_p2) < monitors.size()) {
@@ -224,6 +239,7 @@ struct DualOutput::Impl {
     bool tearing_supported = false;
     bool logged_runtime_err = false;
     bool pending_duo_resize = false;
+    int fullscreen_exit_attempts = 0;
     std::atomic<OutputMode> mode{OutputMode::Solo};
     InputTrigger input_trigger;
     std::atomic<HWND> game_hwnd{nullptr};
@@ -232,6 +248,7 @@ struct DualOutput::Impl {
     UINT src_height = 0;
     DXGI_FORMAT src_format = DXGI_FORMAT_UNKNOWN;
 
+    std::mutex d3d_mtx;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandAllocator> allocators[kFrameSlots];
     ComPtr<ID3D12GraphicsCommandList> cmd_list;
@@ -242,6 +259,14 @@ struct DualOutput::Impl {
     UINT frame_index = 0;
 
     ComPtr<IDXGISwapChain3> out_swapchain[2];
+
+    void NotifyVisibilityChange() const {
+        if (hwnd[0]) {
+            PostMessageW(hwnd[0], kMsgSetVisible, 0, 0);
+        } else if (win_thread_id != 0) {
+            PostThreadMessageW(win_thread_id, kMsgSetVisible, 0, 0);
+        }
+    }
 
     static DWORD WINAPI WindowThreadProc(LPVOID param) {
         auto* self = static_cast<Impl*>(param);
@@ -285,7 +310,13 @@ struct DualOutput::Impl {
         }
 
         bool currently_visible = false;
-        auto apply_visibility = [&](bool show) {
+        auto sync_visibility = [&]() {
+            const HWND gh = self->game_hwnd.load();
+            const ULONGLONG last_ms = self->last_present_ms.load();
+            const bool game_active =
+                (!gh || (IsWindow(gh) && IsWindowVisible(gh) && !IsIconic(gh))) &&
+                (last_ms == 0 || (GetTickCount64() - last_ms) < 1500);
+            const bool show = (self->mode.load() == OutputMode::Duo) && game_active;
             if (show == currently_visible) {
                 return;
             }
@@ -300,17 +331,9 @@ struct DualOutput::Impl {
 
         MSG msg{};
         while (!self->stop_requested.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            if (msg.message == kMsgSetVisible) {
-                apply_visibility(msg.wParam != 0);
-                continue;
-            }
-            if (msg.message == WM_TIMER && msg.hwnd == self->hwnd[0]) {
-                const HWND gh = self->game_hwnd.load();
-                const ULONGLONG last_ms = self->last_present_ms.load();
-                const bool game_active =
-                    (!gh || (IsWindow(gh) && IsWindowVisible(gh) && !IsIconic(gh))) &&
-                    (last_ms == 0 || (GetTickCount64() - last_ms) < 1500);
-                apply_visibility(self->mode.load() == OutputMode::Duo && game_active);
+            if (msg.message == kMsgSetVisible ||
+                (msg.message == WM_TIMER && msg.hwnd == self->hwnd[0])) {
+                sync_visibility();
                 continue;
             }
             TranslateMessage(&msg);
@@ -344,6 +367,11 @@ struct DualOutput::Impl {
     }
 
     void ReleaseD3D12() {
+        std::lock_guard<std::mutex> lock(d3d_mtx);
+        ReleaseD3D12Locked();
+    }
+
+    void ReleaseD3D12Locked() {
         WaitForGpuIdle();
         for (auto& sc : out_swapchain) {
             sc.Reset();
@@ -359,12 +387,14 @@ struct DualOutput::Impl {
         }
         device.Reset();
         pipeline_ready = false;
+        tearing_supported = false;
+        logged_runtime_err = false;
         src_width = 0;
         src_height = 0;
         src_format = DXGI_FORMAT_UNKNOWN;
     }
 
-    bool InitD3D12(IDXGISwapChain3* game_swapchain, ID3D12CommandQueue* game_queue) {
+    bool InitD3D12Locked(IDXGISwapChain3* game_swapchain, ID3D12CommandQueue* game_queue) {
         if (!has_monitors || !hwnd[0] || !hwnd[1]) {
             return false;
         }
@@ -377,6 +407,7 @@ struct DualOutput::Impl {
 
         if (FAILED(game_swapchain->GetDevice(IID_PPV_ARGS(&device)))) {
             Log("DualOutput: failed to get ID3D12Device from game swapchain.");
+            ReleaseD3D12Locked();
             return false;
         }
 
@@ -384,6 +415,7 @@ struct DualOutput::Impl {
             if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                       IID_PPV_ARGS(&allocators[i])))) {
                 Log("DualOutput: CreateCommandAllocator failed.");
+                ReleaseD3D12Locked();
                 return false;
             }
             slot_fence_values[i] = 0;
@@ -393,22 +425,30 @@ struct DualOutput::Impl {
                                              D3D12_COMMAND_LIST_TYPE_DIRECT,
                                              allocators[0].Get(),
                                              nullptr,
-                                             IID_PPV_ARGS(&cmd_list)))) {
-            Log("DualOutput: CreateCommandList failed.");
+                                             IID_PPV_ARGS(&cmd_list))) ||
+            FAILED(cmd_list->Close())) {
+            Log("DualOutput: CreateCommandList/Close failed.");
+            ReleaseD3D12Locked();
             return false;
         }
-        cmd_list->Close();
 
         if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
             Log("DualOutput: CreateFence failed.");
+            ReleaseD3D12Locked();
             return false;
         }
         fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!fence_event) {
+            Log("DualOutput: CreateEventW for fence failed.");
+            ReleaseD3D12Locked();
+            return false;
+        }
         next_fence_value = 1;
 
         ComPtr<IDXGIFactory4> factory;
         if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
             Log("DualOutput: CreateDXGIFactory2 failed.");
+            ReleaseD3D12Locked();
             return false;
         }
 
@@ -442,7 +482,7 @@ struct DualOutput::Impl {
                     static_cast<unsigned>(out_desc.Format),
                     out_desc.Width,
                     out_desc.Height);
-                ReleaseD3D12();
+                ReleaseD3D12Locked();
                 return false;
             }
             factory->MakeWindowAssociation(hwnd[i], DXGI_MWA_NO_ALT_ENTER);
@@ -460,6 +500,152 @@ struct DualOutput::Impl {
             out_desc.Height,
             tearing_supported ? 1 : 0);
         return true;
+    }
+
+    void CopyAndPresent(IDXGISwapChain3* game_swapchain,
+                        ID3D12CommandQueue* game_queue,
+                        OrigPresentFn orig_present) {
+        ComPtr<IDXGISwapChain3> sc_out[2];
+        ComPtr<ID3D12Device> dev_ref;
+        bool tearing = false;
+        bool already_logged_err = false;
+
+        {
+            std::lock_guard<std::mutex> lock(d3d_mtx);
+            if (init_failed) {
+                return;
+            }
+
+            DXGI_SWAP_CHAIN_DESC1 cur_desc{};
+            if (FAILED(game_swapchain->GetDesc1(&cur_desc))) {
+                return;
+            }
+
+            if (pipeline_ready &&
+                (cur_desc.Width != src_width || cur_desc.Height != src_height ||
+                 cur_desc.Format != src_format)) {
+                ReleaseD3D12Locked();
+            }
+
+            if (!pipeline_ready) {
+                if (!InitD3D12Locked(game_swapchain, game_queue)) {
+                    init_failed = true;
+                    return;
+                }
+            }
+
+            const UINT slot = frame_index++ % kFrameSlots;
+            const UINT64 wait_val = slot_fence_values[slot];
+            if (wait_val != 0 && fence->GetCompletedValue() < wait_val) {
+                if (SUCCEEDED(fence->SetEventOnCompletion(wait_val, fence_event))) {
+                    WaitForSingleObject(fence_event, 1000);
+                }
+            }
+
+            ComPtr<ID3D12Resource> src_buf;
+            ComPtr<ID3D12Resource> dst_buf[2];
+            if (FAILED(game_swapchain->GetBuffer(game_swapchain->GetCurrentBackBufferIndex(),
+                                                 IID_PPV_ARGS(&src_buf)))) {
+                return;
+            }
+            for (int i = 0; i < 2; ++i) {
+                if (FAILED(out_swapchain[i]->GetBuffer(
+                        out_swapchain[i]->GetCurrentBackBufferIndex(),
+                        IID_PPV_ARGS(&dst_buf[i])))) {
+                    return;
+                }
+            }
+
+            if (FAILED(allocators[slot]->Reset()) ||
+                FAILED(cmd_list->Reset(allocators[slot].Get(), nullptr))) {
+                return;
+            }
+
+            auto make_barrier = [](ID3D12Resource* res,
+                                   D3D12_RESOURCE_STATES before,
+                                   D3D12_RESOURCE_STATES after) {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = res;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = before;
+                b.Transition.StateAfter = after;
+                return b;
+            };
+
+            const D3D12_RESOURCE_BARRIER pre_barriers[3] = {
+                make_barrier(
+                    src_buf.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                make_barrier(
+                    dst_buf[0].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                make_barrier(
+                    dst_buf[1].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+            };
+            cmd_list->ResourceBarrier(3, pre_barriers);
+
+            const UINT half_w = src_width / 2;
+            D3D12_TEXTURE_COPY_LOCATION src_loc{};
+            src_loc.pResource = src_buf.Get();
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+            const D3D12_BOX boxes[2] = {
+                {0, 0, 0, half_w, src_height, 1},
+                {src_width - half_w, 0, 0, src_width, src_height, 1},
+            };
+
+            for (int i = 0; i < 2; ++i) {
+                D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+                dst_loc.pResource = dst_buf[i].Get();
+                dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &boxes[i]);
+            }
+
+            const D3D12_RESOURCE_BARRIER post_barriers[3] = {
+                make_barrier(
+                    src_buf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+                make_barrier(
+                    dst_buf[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+                make_barrier(
+                    dst_buf[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+            };
+            cmd_list->ResourceBarrier(3, post_barriers);
+
+            if (FAILED(cmd_list->Close())) {
+                ReleaseD3D12Locked();
+                return;
+            }
+
+            ID3D12CommandList* lists[] = {cmd_list.Get()};
+            game_queue->ExecuteCommandLists(1, lists);
+
+            const UINT64 fence_val = next_fence_value++;
+            if (SUCCEEDED(game_queue->Signal(fence.Get(), fence_val))) {
+                slot_fence_values[slot] = fence_val;
+            }
+
+            sc_out[0] = out_swapchain[0];
+            sc_out[1] = out_swapchain[1];
+            dev_ref = device;
+            tearing = tearing_supported;
+            already_logged_err = logged_runtime_err;
+        }
+
+        // Call original Present outside d3d_mtx to avoid re-entering our MinHook detour under lock.
+        const UINT present_flags = tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        for (int i = 0; i < 2; ++i) {
+            const HRESULT hr = orig_present(sc_out[i].Get(), 0, present_flags);
+            if (FAILED(hr) && !already_logged_err) {
+                already_logged_err = true;
+                std::lock_guard<std::mutex> lock(d3d_mtx);
+                if (!logged_runtime_err) {
+                    logged_runtime_err = true;
+                    Log("DualOutput out_swapchain[%d]->Present failed: hr=0x%08X (DeviceRemoved=0x%08X)",
+                        i,
+                        static_cast<unsigned>(hr),
+                        dev_ref ? static_cast<unsigned>(dev_ref->GetDeviceRemovedReason()) : 0U);
+                }
+            }
+        }
     }
 };
 
@@ -502,10 +688,11 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
     }
 
     impl_->last_present_ms.store(GetTickCount64());
-    if (!impl_->game_hwnd.load()) {
-        HWND gh = nullptr;
-        if (SUCCEEDED(game_swapchain->GetHwnd(&gh)) && gh) {
-            impl_->game_hwnd.store(gh);
+    HWND gh = impl_->game_hwnd.load();
+    if (!gh || !IsWindow(gh)) {
+        HWND queried = nullptr;
+        if (SUCCEEDED(game_swapchain->GetHwnd(&queried)) && queried) {
+            impl_->game_hwnd.store(queried);
         }
     }
 
@@ -519,20 +706,23 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
     if (action == TriggerAction::ToggleToDuo) {
         impl_->mode.store(OutputMode::Duo);
         impl_->pending_duo_resize = true;
+        impl_->fullscreen_exit_attempts = 0;
         Log("Mode switched to DUO");
     } else if (action == TriggerAction::ToggleToSolo) {
         impl_->mode.store(OutputMode::Solo);
         impl_->pending_duo_resize = false;
-        if (impl_->win_thread_id != 0) {
-            PostThreadMessageW(impl_->win_thread_id, kMsgSetVisible, 0, 0);
+        impl_->fullscreen_exit_attempts = 0;
+        impl_->NotifyVisibilityChange();
+        {
+            std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
+            impl_->ReleaseD3D12Locked();
+            impl_->init_failed = false;
         }
-        impl_->ReleaseD3D12();
-        impl_->init_failed = false;
         ResizeGameWindowToRect(impl_->game_hwnd.load(), impl_->mon_solo.rect, "solo");
         Log("Mode switched to SOLO");
     }
 
-    if (impl_->mode.load() != OutputMode::Duo || impl_->init_failed) {
+    if (impl_->mode.load() != OutputMode::Duo) {
         return;
     }
 
@@ -540,15 +730,19 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         BOOL is_fullscreen = FALSE;
         if (SUCCEEDED(game_swapchain->GetFullscreenState(&is_fullscreen, nullptr)) &&
             is_fullscreen) {
-            game_swapchain->SetFullscreenState(FALSE, nullptr);
-            return;
+            const HRESULT hr = game_swapchain->SetFullscreenState(FALSE, nullptr);
+            if (SUCCEEDED(hr) && ++impl_->fullscreen_exit_attempts < 5) {
+                return;
+            }
+            Log("Warning: unable to exit fullscreen before duo resize (hr=0x%08X, attempts=%d); proceeding.",
+                static_cast<unsigned>(hr),
+                impl_->fullscreen_exit_attempts);
         }
         impl_->pending_duo_resize = false;
+        impl_->fullscreen_exit_attempts = 0;
         const RECT span_rect = ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
         ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo");
-        if (impl_->win_thread_id != 0) {
-            PostThreadMessageW(impl_->win_thread_id, kMsgSetVisible, 1, 0);
-        }
+        impl_->NotifyVisibilityChange();
     }
 
     if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
@@ -556,123 +750,14 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo-manual");
     }
 
-    DXGI_SWAP_CHAIN_DESC1 cur_desc{};
-    if (FAILED(game_swapchain->GetDesc1(&cur_desc))) {
-        return;
-    }
-
-    if (impl_->pipeline_ready &&
-        (cur_desc.Width != impl_->src_width || cur_desc.Height != impl_->src_height ||
-         cur_desc.Format != impl_->src_format)) {
-        impl_->ReleaseD3D12();
-    }
-
-    if (!impl_->pipeline_ready) {
-        if (!impl_->InitD3D12(game_swapchain, game_queue)) {
-            impl_->init_failed = true;
-            return;
-        }
-    }
-
-    const UINT slot = impl_->frame_index++ % kFrameSlots;
-    const UINT64 wait_val = impl_->slot_fence_values[slot];
-    if (wait_val != 0 && impl_->fence->GetCompletedValue() < wait_val) {
-        if (SUCCEEDED(impl_->fence->SetEventOnCompletion(wait_val, impl_->fence_event))) {
-            WaitForSingleObject(impl_->fence_event, 1000);
-        }
-    }
-
-    ComPtr<ID3D12Resource> src_buf;
-    ComPtr<ID3D12Resource> dst_buf[2];
-    if (FAILED(game_swapchain->GetBuffer(game_swapchain->GetCurrentBackBufferIndex(),
-                                         IID_PPV_ARGS(&src_buf)))) {
-        return;
-    }
-    for (int i = 0; i < 2; ++i) {
-        if (FAILED(impl_->out_swapchain[i]->GetBuffer(
-                impl_->out_swapchain[i]->GetCurrentBackBufferIndex(),
-                IID_PPV_ARGS(&dst_buf[i])))) {
-            return;
-        }
-    }
-
-    if (FAILED(impl_->allocators[slot]->Reset()) ||
-        FAILED(impl_->cmd_list->Reset(impl_->allocators[slot].Get(), nullptr))) {
-        return;
-    }
-
-    auto make_barrier = [](ID3D12Resource* res,
-                           D3D12_RESOURCE_STATES before,
-                           D3D12_RESOURCE_STATES after) {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = res;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = before;
-        b.Transition.StateAfter = after;
-        return b;
-    };
-
-    const D3D12_RESOURCE_BARRIER pre_barriers[3] = {
-        make_barrier(src_buf.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        make_barrier(dst_buf[0].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
-        make_barrier(dst_buf[1].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
-    };
-    impl_->cmd_list->ResourceBarrier(3, pre_barriers);
-
-    const UINT half_w = impl_->src_width / 2;
-    D3D12_TEXTURE_COPY_LOCATION src_loc{};
-    src_loc.pResource = src_buf.Get();
-    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-
-    const D3D12_BOX boxes[2] = {
-        {0, 0, 0, half_w, impl_->src_height, 1},
-        {impl_->src_width - half_w, 0, 0, impl_->src_width, impl_->src_height, 1},
-    };
-
-    for (int i = 0; i < 2; ++i) {
-        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
-        dst_loc.pResource = dst_buf[i].Get();
-        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        impl_->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &boxes[i]);
-    }
-
-    const D3D12_RESOURCE_BARRIER post_barriers[3] = {
-        make_barrier(src_buf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
-        make_barrier(dst_buf[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
-        make_barrier(dst_buf[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
-    };
-    impl_->cmd_list->ResourceBarrier(3, post_barriers);
-
-    if (FAILED(impl_->cmd_list->Close())) {
-        return;
-    }
-
-    ID3D12CommandList* lists[] = {impl_->cmd_list.Get()};
-    game_queue->ExecuteCommandLists(1, lists);
-
-    const UINT64 fence_val = impl_->next_fence_value++;
-    if (SUCCEEDED(game_queue->Signal(impl_->fence.Get(), fence_val))) {
-        impl_->slot_fence_values[slot] = fence_val;
-    }
-
-    // Call original Present directly to avoid re-entering our MinHook detour.
-    const UINT present_flags = impl_->tearing_supported ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    for (int i = 0; i < 2; ++i) {
-        const HRESULT hr = orig_present(impl_->out_swapchain[i].Get(), 0, present_flags);
-        if (FAILED(hr) && !impl_->logged_runtime_err) {
-            impl_->logged_runtime_err = true;
-            Log("DualOutput out_swapchain[%d]->Present failed: hr=0x%08X (DeviceRemoved=0x%08X)",
-                i,
-                static_cast<unsigned>(hr),
-                static_cast<unsigned>(impl_->device->GetDeviceRemovedReason()));
-        }
-    }
+    impl_->CopyAndPresent(game_swapchain, game_queue, orig_present);
 }
 
 void DualOutput::ResetSwapChains() {
     if (impl_) {
-        impl_->ReleaseD3D12();
+        std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
+        impl_->ReleaseD3D12Locked();
+        impl_->init_failed = false;
     }
 }
 
@@ -681,10 +766,15 @@ void DualOutput::Shutdown() {
         return;
     }
     impl_->stop_requested.store(true);
-    if (impl_->win_thread_id != 0) {
-        PostThreadMessageW(impl_->win_thread_id, WM_QUIT, 0, 0);
-    }
     if (impl_->win_thread) {
+        if (impl_->windows_ready_event) {
+            WaitForSingleObject(impl_->windows_ready_event, 2000);
+        }
+        if (impl_->hwnd[0]) {
+            PostMessageW(impl_->hwnd[0], WM_QUIT, 0, 0);
+        } else if (impl_->win_thread_id != 0) {
+            PostThreadMessageW(impl_->win_thread_id, WM_QUIT, 0, 0);
+        }
         WaitForSingleObject(impl_->win_thread, 2000);
         CloseHandle(impl_->win_thread);
         impl_->win_thread = nullptr;
