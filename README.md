@@ -22,25 +22,25 @@ The goal is local co-op only. The game has no online or LAN co-op, and this proj
 
 ## Status
 
-**Pre-alpha / planning.** Nothing here is guaranteed to work yet. This README describes the intended design and will be updated as pieces are proven.
+**Early prototype (Steam D3D12 validated).** Core dual-monitor capture and presentation are working on Steam (`3840x1080` split to two `1920x1080` monitors); two-controller co-op gameplay, menu polish, and Epic Games Store remain to be tested.
 
-- [ ] Proof of concept: hook the game's `Present` call and log frame info
-- [ ] Capture the backbuffer and split it into left/right halves
-- [ ] Create one borderless window per monitor with its own swapchain
-- [ ] Present each half on the correct monitor
+- [x] Proof of concept: hook the game's `Present` call and log frame info
+- [x] Capture the backbuffer and split it into left/right halves
+- [x] Create one borderless window per monitor with its own swapchain
+- [x] Present each half on the correct monitor
 - [ ] Suppress the original presentation to avoid duplicates
-- [ ] Config file (monitor selection, resolution, hotkeys)
-- [ ] Handle menus, pause screen and the shared-camera case
-- [ ] Test on Steam and Epic versions
+- [ ] Config file (monitor selection via `gothamduo.ini` works; resolution and hotkeys config pending)
+- [ ] Handle menus, pause screen and the shared-camera case (`F9` currently toggles the split windows)
+- [ ] Test on Steam (2-controller co-op) and Epic versions
 
-## How it is intended to work
+## How it works
 
 The game runs one instance and draws a vertical split screen (player 1 on the left, player 2 on the right) into a single window. Gotham Duo does not try to render a second camera. Instead it:
 
-1. Runs the game at a wide resolution (for example 3840x1080), so each half is a full 1920x1080 view.
-2. Hooks the Direct3D 12 / DXGI `Present` call.
-3. Copies the left half of the backbuffer to a window on monitor 1 and the right half to a window on monitor 2.
-4. Blocks the original presentation so the game window does not show a duplicate.
+1. Resizes the game window across the combined width of both target monitors (for example `3840x1080`), so each half is a full `1920x1080` view.
+2. Hooks DXGI (`CreateSwapChainForHwnd`, `Present`, `Present1`, `ResizeBuffers`) via a `version.dll` proxy.
+3. Copies the left half of the D3D12 backbuffer to a borderless window on monitor 1 and the right half to monitor 2 using `CopyTextureRegion`.
+4. Forwards focus back to the game window when clicking either output monitor.
 
 ## Requirements (planned)
 
@@ -60,27 +60,33 @@ Before this project is usable, you can test a similar effect with no code:
 
 These workarounds are not verified for this specific game. Results may vary, and menus and HUD will span both monitors.
 
-## Building (planned)
+## Building
 
 ```bash
-git clone https://github.com/<your-user>/gotham-duo.git
-cd gotham-duo
+git clone https://github.com/CarlosAlexandredevv/Gotham-duo.git
+cd Gotham-duo
 cmake -B build -A x64
 cmake --build build --config Release
 ```
 
-Planned dependencies:
+The compiled proxy DLL will be at `build/Release/version.dll`.
 
-- C++20
+Dependencies:
+
+- C++20 (MSVC + MASM x64)
 - Windows SDK (Direct3D 12, DXGI, Win32)
-- [MinHook](https://github.com/TsudaKageyu/minhook) for function hooking
+- [MinHook](https://github.com/TsudaKageyu/minhook) `v1.3.4` (fetched automatically by CMake `FetchContent`)
 
-## Installation (planned)
+## Installation
 
-1. Build or download the release.
-2. Copy the proxy DLL and `gothamduo.ini` next to the game executable.
-3. Launch the game and enable co-op by pressing Start on the second controller.
-4. Choose which monitor each player uses in `gothamduo.ini`.
+1. Build or download `version.dll` (and optionally [config/gothamduo.ini](config/gothamduo.ini)).
+2. Copy `version.dll` (and `gothamduo.ini` if customizing monitors) next to the shipping executable:
+   `LEGOBatmanLotDK\Binaries\Win64\` (alongside `LEGOBatmanLotDK-Win64-Shipping.exe`, **not** the root launcher folder).
+3. Launch the game (Windowed or Borderless mode is recommended) and enable co-op by pressing Start on the second controller.
+4. Hotkeys:
+   - `F9`: Toggle the dual-monitor output windows on/off.
+   - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080`).
+5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`.
 
 ## Known limitations (expected)
 
