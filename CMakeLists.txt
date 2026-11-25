@@ -105,4 +105,11 @@ target_include_directories(split_seam_detector_tests PRIVATE
     src
 )
 
+target_compile_definitions(split_seam_detector_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    UNICODE
+    _UNICODE
+)
+
 add_test(NAME split_seam_detector_tests COMMAND split_seam_detector_tests)

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 
 namespace gotham {
 namespace {
@@ -73,10 +74,12 @@ StripClassification ClassifyCenterStrip(const void* data,
 
     for (uint32_t y = y_begin; y < y_end; y += 4) {
         ++sampled_rows;
-        const auto* row = reinterpret_cast<const uint32_t*>(base + static_cast<size_t>(y) * row_pitch);
+        const uint8_t* row_bytes = base + static_cast<size_t>(y) * row_pitch;
         std::array<Rgb, kSeamStripWidth> px{};
         for (uint32_t x = 0; x < kSeamStripWidth; ++x) {
-            px[x] = DecodePixel(row[x], format);
+            uint32_t raw = 0;
+            std::memcpy(&raw, row_bytes + static_cast<size_t>(x) * sizeof(uint32_t), sizeof(raw));
+            px[x] = DecodePixel(raw, format);
         }
 
         const int local_left = ColorDistL1(px[1], px[3]);
@@ -101,7 +104,7 @@ StripClassification ClassifyCenterStrip(const void* data,
         }
     }
 
-    if (sampled_rows == 0 || active_rows < (sampled_rows / 6)) {
+    if (sampled_rows == 0 || active_rows == 0 || active_rows * 6 < sampled_rows) {
         return StripClassification::Ambiguous;
     }
 
