@@ -2,6 +2,7 @@
 #include "duo_resize_guard.h"
 #include "input_trigger.h"
 #include "log.h"
+#include "split_seam_detector.h"
 
 #include <dxgi1_5.h>
 #include <wrl/client.h>
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -66,6 +68,23 @@ InputConfig LoadInputConfig(HMODULE self_module) {
     const int hold_ms = static_cast<int>(
         GetPrivateProfileIntW(L"Input", L"HoldBackStartMs", 800, ini_path));
     cfg.hold_back_start_ms = static_cast<uint32_t>(hold_ms <= 0 ? 800 : hold_ms);
+    return cfg;
+}
+
+MirrorConfig LoadMirrorConfig(HMODULE self_module) {
+    MirrorConfig cfg{};
+    wchar_t ini_path[MAX_PATH] = {};
+    if (!BuildIniPath(self_module, ini_path)) {
+        return cfg;
+    }
+
+    cfg.auto_detect = GetPrivateProfileIntW(L"MenuMirror", L"AutoDetect", 1, ini_path) != 0;
+    const int enter_ms = static_cast<int>(
+        GetPrivateProfileIntW(L"MenuMirror", L"EnterMirrorMs", 150, ini_path));
+    const int exit_ms = static_cast<int>(
+        GetPrivateProfileIntW(L"MenuMirror", L"ExitMirrorMs", 100, ini_path));
+    cfg.enter_mirror_ms = static_cast<uint32_t>(enter_ms < 0 ? 150 : enter_ms);
+    cfg.exit_mirror_ms = static_cast<uint32_t>(exit_ms < 0 ? 100 : exit_ms);
     return cfg;
 }
 
@@ -262,6 +281,14 @@ struct DualOutput::Impl {
     UINT frame_index = 0;
 
     ComPtr<IDXGISwapChain3> out_swapchain[2];
+    ComPtr<ID3D12Resource> seam_readback[kFrameSlots];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT seam_footprint{};
+    UINT64 seam_readback_bytes = 0;
+    bool seam_readback_valid[kFrameSlots]{};
+    bool seam_readback_ready = false;
+    bool logged_seam_unsupported = false;
+    bool logged_seam_readback_err = false;
+    MirrorStateMachine mirror_state;
 
     void NotifyVisibilityChange() const {
         if (hwnd[0]) {
@@ -379,6 +406,15 @@ struct DualOutput::Impl {
         for (auto& sc : out_swapchain) {
             sc.Reset();
         }
+        for (UINT i = 0; i < kFrameSlots; ++i) {
+            seam_readback[i].Reset();
+            seam_readback_valid[i] = false;
+        }
+        seam_footprint = {};
+        seam_readback_bytes = 0;
+        seam_readback_ready = false;
+        logged_seam_readback_err = false;
+        mirror_state.Reset();
         cmd_list.Reset();
         for (auto& alloc : allocators) {
             alloc.Reset();
@@ -395,6 +431,81 @@ struct DualOutput::Impl {
         src_width = 0;
         src_height = 0;
         src_format = DXGI_FORMAT_UNKNOWN;
+    }
+
+    void InitSeamReadbackLocked(const DXGI_SWAP_CHAIN_DESC1& desc) {
+        seam_readback_ready = false;
+        for (UINT i = 0; i < kFrameSlots; ++i) {
+            seam_readback[i].Reset();
+            seam_readback_valid[i] = false;
+        }
+        if (!mirror_state.config().auto_detect) {
+            return;
+        }
+        if (desc.Width < kSeamStripWidth || (desc.Width / 2) < (kSeamStripWidth / 2)) {
+            return;
+        }
+        if (!IsSupportedSeamFormat(desc.Format)) {
+            if (!logged_seam_unsupported) {
+                logged_seam_unsupported = true;
+                Log("MenuMirror auto-detect disabled: unsupported DXGI_FORMAT %u (use F8 manual toggle).",
+                    static_cast<unsigned>(desc.Format));
+            }
+            return;
+        }
+
+        D3D12_RESOURCE_DESC strip_desc{};
+        strip_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        strip_desc.Width = kSeamStripWidth;
+        strip_desc.Height = desc.Height;
+        strip_desc.DepthOrArraySize = 1;
+        strip_desc.MipLevels = 1;
+        strip_desc.Format = desc.Format;
+        strip_desc.SampleDesc.Count = 1;
+        strip_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT64 total_bytes = 0;
+        device->GetCopyableFootprints(&strip_desc, 0, 1, 0, &footprint, nullptr, nullptr, &total_bytes);
+        if (total_bytes == 0) {
+            return;
+        }
+
+        D3D12_HEAP_PROPERTIES rb_heap{};
+        rb_heap.Type = D3D12_HEAP_TYPE_READBACK;
+
+        D3D12_RESOURCE_DESC rb_desc{};
+        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rb_desc.Width = total_bytes;
+        rb_desc.Height = 1;
+        rb_desc.DepthOrArraySize = 1;
+        rb_desc.MipLevels = 1;
+        rb_desc.Format = DXGI_FORMAT_UNKNOWN;
+        rb_desc.SampleDesc.Count = 1;
+        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        for (UINT i = 0; i < kFrameSlots; ++i) {
+            const HRESULT hr = device->CreateCommittedResource(
+                &rb_heap,
+                D3D12_HEAP_FLAG_NONE,
+                &rb_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&seam_readback[i]));
+            if (FAILED(hr)) {
+                Log("MenuMirror readback alloc[%u] failed (hr=0x%08X); falling back to F8 manual toggle.",
+                    i,
+                    static_cast<unsigned>(hr));
+                for (auto& rb : seam_readback) {
+                    rb.Reset();
+                }
+                return;
+            }
+        }
+
+        seam_footprint = footprint;
+        seam_readback_bytes = total_bytes;
+        seam_readback_ready = true;
     }
 
     bool InitD3D12Locked(IDXGISwapChain3* game_swapchain, ID3D12CommandQueue* game_queue) {
@@ -491,6 +602,7 @@ struct DualOutput::Impl {
             factory->MakeWindowAssociation(hwnd[i], DXGI_MWA_NO_ALT_ENTER);
         }
 
+        InitSeamReadbackLocked(desc);
         src_width = desc.Width;
         src_height = desc.Height;
         src_format = desc.Format;
@@ -507,7 +619,9 @@ struct DualOutput::Impl {
 
     void CopyAndPresent(IDXGISwapChain3* game_swapchain,
                         ID3D12CommandQueue* game_queue,
-                        OrigPresentFn orig_present) {
+                        OrigPresentFn orig_present,
+                        bool f8_down,
+                        ULONGLONG now_ms) {
         ComPtr<IDXGISwapChain3> sc_out[2];
         ComPtr<ID3D12Device> dev_ref;
         bool tearing = false;
@@ -543,6 +657,35 @@ struct DualOutput::Impl {
                 if (SUCCEEDED(fence->SetEventOnCompletion(wait_val, fence_event))) {
                     WaitForSingleObject(fence_event, 1000);
                 }
+            }
+            const bool slot_gpu_done = (wait_val == 0) || (fence->GetCompletedValue() >= wait_val);
+
+            std::optional<StripClassification> sample;
+            if (slot_gpu_done && seam_readback_ready && seam_readback_valid[slot] &&
+                mirror_state.config().auto_detect) {
+                const D3D12_RANGE read_range{0, static_cast<SIZE_T>(seam_readback_bytes)};
+                void* mapped = nullptr;
+                const HRESULT map_hr = seam_readback[slot]->Map(0, &read_range, &mapped);
+                if (SUCCEEDED(map_hr) && mapped) {
+                    sample = ClassifyCenterStrip(mapped,
+                                                 seam_footprint.Footprint.RowPitch,
+                                                 src_height,
+                                                 src_format);
+                    const D3D12_RANGE empty_written{0, 0};
+                    seam_readback[slot]->Unmap(0, &empty_written);
+                } else if (!logged_seam_readback_err) {
+                    logged_seam_readback_err = true;
+                    Log("MenuMirror readback Map failed (hr=0x%08X).",
+                        static_cast<unsigned>(map_hr));
+                }
+            }
+
+            const MirrorUpdateResult mirror_res =
+                mirror_state.Update(f8_down, sample, static_cast<uint64_t>(now_ms));
+            if (mirror_res.transitioned) {
+                Log("DUO layout: %s (%s)",
+                    mirror_res.is_mirroring ? "MIRROR" : "SPLIT",
+                    mirror_res.reason);
             }
 
             ComPtr<ID3D12Resource> src_buf;
@@ -587,13 +730,19 @@ struct DualOutput::Impl {
             cmd_list->ResourceBarrier(3, pre_barriers);
 
             const UINT half_w = src_width / 2;
+            const UINT center_x = (src_width - half_w) / 2;
             D3D12_TEXTURE_COPY_LOCATION src_loc{};
             src_loc.pResource = src_buf.Get();
             src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 
-            const D3D12_BOX boxes[2] = {
+            const D3D12_BOX split_boxes[2] = {
                 {0, 0, 0, half_w, src_height, 1},
                 {src_width - half_w, 0, 0, src_width, src_height, 1},
+            };
+            const D3D12_BOX mirror_box{center_x, 0, 0, center_x + half_w, src_height, 1};
+            const D3D12_BOX boxes[2] = {
+                mirror_res.is_mirroring ? mirror_box : split_boxes[0],
+                mirror_res.is_mirroring ? mirror_box : split_boxes[1],
             };
 
             for (int i = 0; i < 2; ++i) {
@@ -601,6 +750,20 @@ struct DualOutput::Impl {
                 dst_loc.pResource = dst_buf[i].Get();
                 dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &boxes[i]);
+            }
+
+            bool queued_readback = false;
+            if (seam_readback_ready && mirror_state.config().auto_detect && slot_gpu_done) {
+                D3D12_TEXTURE_COPY_LOCATION rb_dst{};
+                rb_dst.pResource = seam_readback[slot].Get();
+                rb_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                rb_dst.PlacedFootprint = seam_footprint;
+
+                const UINT strip_left = half_w - (kSeamStripWidth / 2);
+                const D3D12_BOX strip_box{
+                    strip_left, 0, 0, strip_left + kSeamStripWidth, src_height, 1};
+                cmd_list->CopyTextureRegion(&rb_dst, 0, 0, 0, &src_loc, &strip_box);
+                queued_readback = true;
             }
 
             const D3D12_RESOURCE_BARRIER post_barriers[3] = {
@@ -622,9 +785,11 @@ struct DualOutput::Impl {
             game_queue->ExecuteCommandLists(1, lists);
 
             const UINT64 fence_val = next_fence_value++;
-            if (SUCCEEDED(game_queue->Signal(fence.Get(), fence_val))) {
+            const bool signaled = SUCCEEDED(game_queue->Signal(fence.Get(), fence_val));
+            if (signaled) {
                 slot_fence_values[slot] = fence_val;
             }
+            seam_readback_valid[slot] = queued_readback && signaled;
 
             sc_out[0] = out_swapchain[0];
             sc_out[1] = out_swapchain[1];
@@ -663,6 +828,7 @@ void DualOutput::Start(HMODULE self_module) {
     impl_ = new Impl();
     impl_->self_module = self_module;
     impl_->input_trigger.SetConfig(LoadInputConfig(self_module));
+    impl_->mirror_state.SetConfig(LoadMirrorConfig(self_module));
 
     const auto monitors = QueryMonitors();
     impl_->has_monitors =
@@ -712,6 +878,10 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         impl_->fullscreen_exit_attempts = 0;
         impl_->duo_resize_reason = "duo";
         impl_->duo_resize_guard.Reset();
+        {
+            std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
+            impl_->mirror_state.Reset();
+        }
         Log("Mode switched to DUO");
     } else if (action == TriggerAction::ToggleToSolo) {
         impl_->mode.store(OutputMode::Solo);
@@ -793,7 +963,8 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo-manual");
     }
 
-    impl_->CopyAndPresent(game_swapchain, game_queue, orig_present);
+    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    impl_->CopyAndPresent(game_swapchain, game_queue, orig_present, f8_down, now_ms);
 }
 
 void DualOutput::ResetSwapChains() {
