@@ -133,9 +133,63 @@ void MirrorStateMachine::Reset() {
     candidate_start_ms_.reset();
 }
 
-MirrorUpdateResult MirrorStateMachine::Update(bool,
-                                              std::optional<StripClassification>,
-                                              uint64_t) {
+MirrorUpdateResult MirrorStateMachine::Update(bool f8_down,
+                                              std::optional<StripClassification> sample,
+                                              uint64_t now_ms) {
+    const bool f8_rising = f8_down && !prev_f8_down_;
+    prev_f8_down_ = f8_down;
+
+    if (f8_rising) {
+        candidate_kind_.reset();
+        candidate_start_ms_.reset();
+        const bool was_mirroring = is_mirroring_;
+
+        if (!config_.auto_detect || override_mode_ == MirrorOverrideMode::Auto) {
+            is_mirroring_ = !is_mirroring_;
+            override_mode_ = is_mirroring_ ? MirrorOverrideMode::ManualMirror
+                                           : MirrorOverrideMode::ManualSplit;
+            return MirrorUpdateResult{is_mirroring_, is_mirroring_ != was_mirroring, "manual F8"};
+        }
+
+        override_mode_ = MirrorOverrideMode::Auto;
+        return MirrorUpdateResult{is_mirroring_, false, "auto resumed"};
+    }
+
+    if (override_mode_ != MirrorOverrideMode::Auto || !config_.auto_detect ||
+        !sample.has_value()) {
+        return MirrorUpdateResult{is_mirroring_, false, ""};
+    }
+
+    const StripClassification cls = *sample;
+    if (cls == StripClassification::Ambiguous) {
+        candidate_kind_.reset();
+        candidate_start_ms_.reset();
+        return MirrorUpdateResult{is_mirroring_, false, ""};
+    }
+
+    const bool wants_mirror = (cls == StripClassification::Shared);
+    if (wants_mirror == is_mirroring_) {
+        candidate_kind_.reset();
+        candidate_start_ms_.reset();
+        return MirrorUpdateResult{is_mirroring_, false, ""};
+    }
+
+    if (!candidate_kind_.has_value() || *candidate_kind_ != cls ||
+        !candidate_start_ms_.has_value() || now_ms < *candidate_start_ms_) {
+        candidate_kind_ = cls;
+        candidate_start_ms_ = now_ms;
+    }
+
+    const uint64_t hold_ms =
+        wants_mirror ? static_cast<uint64_t>(config_.enter_mirror_ms)
+                     : static_cast<uint64_t>(config_.exit_mirror_ms);
+    if ((now_ms - *candidate_start_ms_) >= hold_ms) {
+        is_mirroring_ = wants_mirror;
+        candidate_kind_.reset();
+        candidate_start_ms_.reset();
+        return MirrorUpdateResult{is_mirroring_, true, "auto"};
+    }
+
     return MirrorUpdateResult{is_mirroring_, false, ""};
 }
 

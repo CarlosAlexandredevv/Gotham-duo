@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 #define CHECK(cond)                                                                        \
@@ -20,6 +21,10 @@ namespace {
 using gotham::ClassifyCenterStrip;
 using gotham::IsSupportedSeamFormat;
 using gotham::kSeamStripWidth;
+using gotham::MirrorConfig;
+using gotham::MirrorOverrideMode;
+using gotham::MirrorStateMachine;
+using gotham::MirrorUpdateResult;
 using gotham::StripClassification;
 
 struct Rgb8 {
@@ -216,6 +221,90 @@ void TestBoundaryAndAmbiguousCases() {
                               DXGI_FORMAT_R10G10B10A2_UNORM) == StripClassification::Split);
 }
 
+void TestMirrorHysteresisAndAmbiguousHold() {
+    MirrorStateMachine sm;
+    MirrorConfig cfg{};
+    cfg.auto_detect = true;
+    cfg.enter_mirror_ms = 150;
+    cfg.exit_mirror_ms = 100;
+    sm.SetConfig(cfg);
+
+    // Starts in Auto + Split.
+    CHECK(!sm.is_mirroring());
+    CHECK(sm.override_mode() == MirrorOverrideMode::Auto);
+
+    // Shared samples enter Mirror only after 150 ms.
+    CHECK(!sm.Update(false, StripClassification::Shared, 1000).is_mirroring);
+    CHECK(!sm.Update(false, StripClassification::Shared, 1149).is_mirroring);
+    MirrorUpdateResult entered = sm.Update(false, StripClassification::Shared, 1150);
+    CHECK(entered.is_mirroring);
+    CHECK(entered.transitioned);
+
+    // Ambiguous frames (e.g. black loading screen) keep Mirror active and reset exit timer.
+    CHECK(sm.Update(false, StripClassification::Split, 1200).is_mirroring);
+    CHECK(sm.Update(false, StripClassification::Ambiguous, 1250).is_mirroring);
+    CHECK(sm.Update(false, StripClassification::Split, 1300).is_mirroring);
+    CHECK(sm.Update(false, StripClassification::Split, 1399).is_mirroring);
+    MirrorUpdateResult exited = sm.Update(false, StripClassification::Split, 1400);
+    CHECK(!exited.is_mirroring);
+    CHECK(exited.transitioned);
+
+    // Non-monotonic timestamp resets candidate start without underflow.
+    CHECK(!sm.Update(false, StripClassification::Shared, 2000).is_mirroring);
+    CHECK(!sm.Update(false, StripClassification::Shared, 1900).is_mirroring);
+    CHECK(!sm.Update(false, StripClassification::Shared, 2049).is_mirroring);
+    CHECK(sm.Update(false, StripClassification::Shared, 2050).is_mirroring);
+}
+
+void TestMirrorF8AutoAndManualOverrides() {
+    MirrorStateMachine sm;
+    MirrorConfig cfg{};
+    cfg.auto_detect = true;
+    cfg.enter_mirror_ms = 150;
+    cfg.exit_mirror_ms = 100;
+    sm.SetConfig(cfg);
+
+    // In Auto + Split, F8 rising edge locks ManualMirror; holding F8 does not retrigger.
+    MirrorUpdateResult r = sm.Update(true, std::nullopt, 100);
+    CHECK(r.is_mirroring && r.transitioned);
+    CHECK(sm.override_mode() == MirrorOverrideMode::ManualMirror);
+
+    r = sm.Update(true, StripClassification::Split, 300);
+    CHECK(r.is_mirroring && !r.transitioned);
+
+    // Release F8, then press F8 again -> returns to Auto (still mirroring until Split settles).
+    CHECK(sm.Update(false, std::nullopt, 310).is_mirroring);
+    r = sm.Update(true, std::nullopt, 320);
+    CHECK(sm.override_mode() == MirrorOverrideMode::Auto);
+    CHECK(r.is_mirroring && !r.transitioned);
+
+    // After 100 ms of Split in Auto, returns to Split.
+    CHECK(sm.Update(false, StripClassification::Split, 330).is_mirroring);
+    CHECK(!sm.Update(false, StripClassification::Split, 430).is_mirroring);
+
+    // AutoDetect=0 toggles directly ManualSplit <-> ManualMirror on F8 rising edge.
+    cfg.auto_detect = false;
+    sm.SetConfig(cfg);
+    CHECK(sm.override_mode() == MirrorOverrideMode::ManualSplit);
+    CHECK(!sm.Update(false, StripClassification::Shared, 1000).is_mirroring);
+    r = sm.Update(true, std::nullopt, 1010);
+    CHECK(r.is_mirroring && r.transitioned);
+    CHECK(sm.override_mode() == MirrorOverrideMode::ManualMirror);
+    CHECK(sm.Update(false, std::nullopt, 1020).is_mirroring);
+    r = sm.Update(true, std::nullopt, 1030);
+    CHECK(!r.is_mirroring && r.transitioned);
+    CHECK(sm.override_mode() == MirrorOverrideMode::ManualSplit);
+
+    // Reset restores Auto + Split (when auto_detect=true).
+    cfg.auto_detect = true;
+    sm.SetConfig(cfg);
+    sm.Update(true, std::nullopt, 1100);
+    CHECK(sm.is_mirroring());
+    sm.Reset();
+    CHECK(!sm.is_mirroring());
+    CHECK(sm.override_mode() == MirrorOverrideMode::Auto);
+}
+
 }  // namespace
 
 int main() {
@@ -223,6 +312,8 @@ int main() {
     TestClassifySplitAndSharedAcrossFormats();
     TestCenteredMenuOverSplitAndUniformBlack();
     TestBoundaryAndAmbiguousCases();
+    TestMirrorHysteresisAndAmbiguousHold();
+    TestMirrorF8AutoAndManualOverrides();
     std::printf("All split_seam_detector_tests passed.\n");
     return 0;
 }
