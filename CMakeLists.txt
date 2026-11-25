@@ -24,6 +24,7 @@ add_library(gothamduo SHARED
     src/dual_output.cpp
     src/dxgi_hook.cpp
     src/input_trigger.cpp
+    src/split_seam_detector.cpp
     src/version_proxy.cpp
     src/version_trampolines.asm
     src/version.def
@@ -90,3 +91,25 @@ target_include_directories(duo_resize_guard_tests PRIVATE
 )
 
 add_test(NAME duo_resize_guard_tests COMMAND duo_resize_guard_tests)
+
+add_executable(split_seam_detector_tests
+    tests/split_seam_detector_test.cpp
+    src/split_seam_detector.cpp
+)
+
+set_target_properties(split_seam_detector_tests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+target_include_directories(split_seam_detector_tests PRIVATE
+    src
+)
+
+target_compile_definitions(split_seam_detector_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    UNICODE
+    _UNICODE
+)
+
+add_test(NAME split_seam_detector_tests COMMAND split_seam_detector_tests)

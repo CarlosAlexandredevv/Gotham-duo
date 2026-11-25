@@ -31,7 +31,7 @@ The goal is local co-op only. The game has no online or LAN co-op, and this proj
 - [x] Automatic Solo/Duo mode switching (starts in Solo; switches to Duo on P2 `Start` or `F9`, returns to Solo on `Back + Start` hold or `F9`)
 - [ ] Suppress the original presentation to avoid duplicates
 - [ ] Config file (monitor selection and input triggers via `gothamduo.ini` work; full hotkey/resolution config pending)
-- [ ] Handle menus, pause screen and the shared-camera case (`F9` or holding `Back + Start` on Controller 2 returns to Solo mode)
+- [ ] Handle menus, pause screen and the shared-camera case (Phase 1: centered menus and shared screens mirror automatically across both monitors in Duo mode, with `F8` manual toggle; Phase 2: centered subtitles/HUD prompts over active split-screen remain pending)
 - [ ] Test on Steam (2-controller co-op) and Epic versions
 
 ## How it works
@@ -86,12 +86,13 @@ Dependencies:
 4. Switching modes:
    - **Solo → Duo:** Press `Start` on Controller 2 (auto-detected) or press `F9`.
    - **Duo → Solo:** Hold `Back + Start` on Controller 2 for `800 ms` (configurable) or press `F9`.
+   - `F8`: Toggle mirrored menu mode manually in Duo mode (overrides auto-detection; press again to return to `Auto`).
    - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080`) while in Duo mode.
-5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`).
+5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`). Under `[MenuMirror]`, you can configure `AutoDetect` (`1` to auto-mirror centered/shared screens in Duo mode, `0` for manual `F8` only), `EnterMirrorMs` (default `150`), and `ExitMirrorMs` (default `100`).
 
 ## Known limitations (expected)
 
-- Menus, HUD and pause screens are drawn across both halves.
+- Centered menus and shared screens now mirror across both monitors in Duo mode (`AutoDetect` / `F8`), while centered subtitles and shared HUD prompts drawn over active split-screen still span the center seam (pending Phase 2).
 - When players are close together, the game may merge back into a shared camera, which would stretch across both monitors.
 - Input may be ignored when the game window does not have focus.
 - Audio stays on a single output.
