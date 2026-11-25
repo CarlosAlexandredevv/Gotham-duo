@@ -414,7 +414,6 @@ struct DualOutput::Impl {
         seam_readback_bytes = 0;
         seam_readback_ready = false;
         logged_seam_readback_err = false;
-        mirror_state.Reset();
         cmd_list.Reset();
         for (auto& alloc : allocators) {
             alloc.Reset();
@@ -442,7 +441,7 @@ struct DualOutput::Impl {
         if (!mirror_state.config().auto_detect) {
             return;
         }
-        if (desc.Width < kSeamStripWidth || (desc.Width / 2) < (kSeamStripWidth / 2)) {
+        if (desc.Width < kSeamStripWidth) {
             return;
         }
         if (!IsSupportedSeamFormat(desc.Format)) {
@@ -467,7 +466,7 @@ struct DualOutput::Impl {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         UINT64 total_bytes = 0;
         device->GetCopyableFootprints(&strip_desc, 0, 1, 0, &footprint, nullptr, nullptr, &total_bytes);
-        if (total_bytes == 0) {
+        if (total_bytes == 0 || total_bytes == UINT64_MAX) {
             return;
         }
 
@@ -617,6 +616,43 @@ struct DualOutput::Impl {
         return true;
     }
 
+    MirrorUpdateResult UpdateMirrorFromReadbackLocked(UINT slot,
+                                                      bool slot_gpu_done,
+                                                      bool f8_down,
+                                                      ULONGLONG now_ms) {
+        std::optional<StripClassification> sample;
+        if (slot_gpu_done) {
+            const bool has_readback = seam_readback_valid[slot];
+            seam_readback_valid[slot] = false;
+            if (has_readback && seam_readback_ready && mirror_state.config().auto_detect) {
+                const D3D12_RANGE read_range{0, static_cast<SIZE_T>(seam_readback_bytes)};
+                void* mapped = nullptr;
+                const HRESULT map_hr = seam_readback[slot]->Map(0, &read_range, &mapped);
+                if (SUCCEEDED(map_hr) && mapped) {
+                    sample = ClassifyCenterStrip(mapped,
+                                                 seam_footprint.Footprint.RowPitch,
+                                                 src_height,
+                                                 src_format);
+                    const D3D12_RANGE empty_written{0, 0};
+                    seam_readback[slot]->Unmap(0, &empty_written);
+                } else if (!logged_seam_readback_err) {
+                    logged_seam_readback_err = true;
+                    Log("MenuMirror readback Map failed (hr=0x%08X).",
+                        static_cast<unsigned>(map_hr));
+                }
+            }
+        }
+
+        const MirrorUpdateResult mirror_res =
+            mirror_state.Update(f8_down, sample, static_cast<uint64_t>(now_ms));
+        if (mirror_res.transitioned) {
+            Log("DUO layout: %s (%s)",
+                mirror_res.is_mirroring ? "MIRROR" : "SPLIT",
+                mirror_res.reason);
+        }
+        return mirror_res;
+    }
+
     void CopyAndPresent(IDXGISwapChain3* game_swapchain,
                         ID3D12CommandQueue* game_queue,
                         OrigPresentFn orig_present,
@@ -660,33 +696,8 @@ struct DualOutput::Impl {
             }
             const bool slot_gpu_done = (wait_val == 0) || (fence->GetCompletedValue() >= wait_val);
 
-            std::optional<StripClassification> sample;
-            if (slot_gpu_done && seam_readback_ready && seam_readback_valid[slot] &&
-                mirror_state.config().auto_detect) {
-                const D3D12_RANGE read_range{0, static_cast<SIZE_T>(seam_readback_bytes)};
-                void* mapped = nullptr;
-                const HRESULT map_hr = seam_readback[slot]->Map(0, &read_range, &mapped);
-                if (SUCCEEDED(map_hr) && mapped) {
-                    sample = ClassifyCenterStrip(mapped,
-                                                 seam_footprint.Footprint.RowPitch,
-                                                 src_height,
-                                                 src_format);
-                    const D3D12_RANGE empty_written{0, 0};
-                    seam_readback[slot]->Unmap(0, &empty_written);
-                } else if (!logged_seam_readback_err) {
-                    logged_seam_readback_err = true;
-                    Log("MenuMirror readback Map failed (hr=0x%08X).",
-                        static_cast<unsigned>(map_hr));
-                }
-            }
-
             const MirrorUpdateResult mirror_res =
-                mirror_state.Update(f8_down, sample, static_cast<uint64_t>(now_ms));
-            if (mirror_res.transitioned) {
-                Log("DUO layout: %s (%s)",
-                    mirror_res.is_mirroring ? "MIRROR" : "SPLIT",
-                    mirror_res.reason);
-            }
+                UpdateMirrorFromReadbackLocked(slot, slot_gpu_done, f8_down, now_ms);
 
             ComPtr<ID3D12Resource> src_buf;
             ComPtr<ID3D12Resource> dst_buf[2];
@@ -869,6 +880,7 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
     std::array<ControllerButtons, 4> slots{};
     PollSystemInput(f9_down, slots);
 
+    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     const bool is_duo = impl_->mode.load() == OutputMode::Duo;
     const TriggerAction action =
         impl_->input_trigger.Update(is_duo, f9_down, slots, GetTickCount64());
@@ -880,7 +892,7 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         impl_->duo_resize_guard.Reset();
         {
             std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
-            impl_->mirror_state.Reset();
+            impl_->mirror_state.Reset(f8_down);
         }
         Log("Mode switched to DUO");
     } else if (action == TriggerAction::ToggleToSolo) {
@@ -894,6 +906,7 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
             std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
             impl_->ReleaseD3D12Locked();
             impl_->init_failed = false;
+            impl_->mirror_state.Reset(false);
         }
         ResizeGameWindowToRect(impl_->game_hwnd.load(), impl_->mon_solo.rect, "solo");
         Log("Mode switched to SOLO");
@@ -963,7 +976,6 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo-manual");
     }
 
-    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     impl_->CopyAndPresent(game_swapchain, game_queue, orig_present, f8_down, now_ms);
 }
 

@@ -48,7 +48,7 @@ public:
     void SetConfig(MirrorConfig config);
     const MirrorConfig& config() const { return config_; }
 
-    void Reset();
+    void Reset(bool f8_down = false);
 
     MirrorUpdateResult Update(bool f8_down,
                               std::optional<StripClassification> sample,

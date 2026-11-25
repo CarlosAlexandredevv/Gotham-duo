@@ -124,11 +124,11 @@ void MirrorStateMachine::SetConfig(MirrorConfig config) {
     Reset();
 }
 
-void MirrorStateMachine::Reset() {
+void MirrorStateMachine::Reset(bool f8_down) {
     override_mode_ = config_.auto_detect ? MirrorOverrideMode::Auto
                                          : MirrorOverrideMode::ManualSplit;
     is_mirroring_ = false;
-    prev_f8_down_ = false;
+    prev_f8_down_ = f8_down;
     candidate_kind_.reset();
     candidate_start_ms_.reset();
 }

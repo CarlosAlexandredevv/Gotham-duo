@@ -303,6 +303,16 @@ void TestMirrorF8AutoAndManualOverrides() {
     sm.Reset();
     CHECK(!sm.is_mirroring());
     CHECK(sm.override_mode() == MirrorOverrideMode::Auto);
+
+    // Reset(true) prevents a held F8 across mode toggle from firing a spurious rising edge.
+    sm.Reset(true);
+    r = sm.Update(true, std::nullopt, 1200);
+    CHECK(!r.is_mirroring && !r.transitioned);
+    CHECK(sm.override_mode() == MirrorOverrideMode::Auto);
+    CHECK(!sm.Update(false, std::nullopt, 1210).is_mirroring);
+    r = sm.Update(true, std::nullopt, 1220);
+    CHECK(r.is_mirroring && r.transitioned);
+    CHECK(sm.override_mode() == MirrorOverrideMode::ManualMirror);
 }
 
 }  // namespace
