@@ -1,4 +1,5 @@
 #include "dual_output.h"
+#include "duo_resize_guard.h"
 #include "input_trigger.h"
 #include "log.h"
 
@@ -240,6 +241,8 @@ struct DualOutput::Impl {
     bool logged_runtime_err = false;
     bool pending_duo_resize = false;
     int fullscreen_exit_attempts = 0;
+    const char* duo_resize_reason = "duo";
+    DuoResizeGuard duo_resize_guard{};
     std::atomic<OutputMode> mode{OutputMode::Solo};
     InputTrigger input_trigger;
     std::atomic<HWND> game_hwnd{nullptr};
@@ -707,11 +710,15 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         impl_->mode.store(OutputMode::Duo);
         impl_->pending_duo_resize = true;
         impl_->fullscreen_exit_attempts = 0;
+        impl_->duo_resize_reason = "duo";
+        impl_->duo_resize_guard.Reset();
         Log("Mode switched to DUO");
     } else if (action == TriggerAction::ToggleToSolo) {
         impl_->mode.store(OutputMode::Solo);
         impl_->pending_duo_resize = false;
         impl_->fullscreen_exit_attempts = 0;
+        impl_->duo_resize_reason = "duo";
+        impl_->duo_resize_guard.Reset();
         impl_->NotifyVisibilityChange();
         {
             std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
@@ -724,6 +731,41 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
 
     if (impl_->mode.load() != OutputMode::Duo) {
         return;
+    }
+
+    const RECT span_rect = ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
+    const UINT expected_w = static_cast<UINT>(span_rect.right - span_rect.left);
+    const UINT expected_h = static_cast<UINT>(span_rect.bottom - span_rect.top);
+    const ULONGLONG now_ms = GetTickCount64();
+
+    if (!impl_->pending_duo_resize) {
+        const HWND active_gh = impl_->game_hwnd.load();
+        const bool window_active =
+            active_gh && IsWindow(active_gh) && IsWindowVisible(active_gh) && !IsIconic(active_gh);
+        DXGI_SWAP_CHAIN_DESC1 cur_desc{};
+        if (window_active && SUCCEEDED(game_swapchain->GetDesc1(&cur_desc))) {
+            bool hit_limit = false;
+            if (impl_->duo_resize_guard.ShouldReapply(
+                    cur_desc.Width, cur_desc.Height, expected_w, expected_h, now_ms, hit_limit)) {
+                Log("Duo backbuffer mismatch (%ux%u != expected %ux%u); re-applying duo resize (attempt %d/%d)",
+                    cur_desc.Width,
+                    cur_desc.Height,
+                    expected_w,
+                    expected_h,
+                    impl_->duo_resize_guard.retry_count,
+                    DuoResizeGuard::kMaxRetries);
+                impl_->pending_duo_resize = true;
+                impl_->fullscreen_exit_attempts = 0;
+                impl_->duo_resize_reason = "duo-reapply";
+            } else if (hit_limit) {
+                Log("Duo backbuffer stayed %ux%u (expected %ux%u) after %d attempts; stopping auto-resize (press F10 to retry).",
+                    cur_desc.Width,
+                    cur_desc.Height,
+                    expected_w,
+                    expected_h,
+                    DuoResizeGuard::kMaxRetries);
+            }
+        }
     }
 
     if (impl_->pending_duo_resize) {
@@ -740,13 +782,14 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         }
         impl_->pending_duo_resize = false;
         impl_->fullscreen_exit_attempts = 0;
-        const RECT span_rect = ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
-        ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo");
+        ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, impl_->duo_resize_reason);
+        impl_->duo_resize_guard.NoteResizeRequested(GetTickCount64());
         impl_->NotifyVisibilityChange();
     }
 
     if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
-        const RECT span_rect = ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
+        impl_->duo_resize_guard.Reset();
+        impl_->duo_resize_guard.NoteResizeRequested(now_ms);
         ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo-manual");
     }
 

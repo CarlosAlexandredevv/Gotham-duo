@@ -76,3 +76,17 @@ target_link_libraries(gothamduo_tests PRIVATE
 )
 
 add_test(NAME input_trigger_tests COMMAND gothamduo_tests)
+
+add_executable(duo_resize_guard_tests
+    tests/duo_resize_guard_test.cpp
+)
+
+set_target_properties(duo_resize_guard_tests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+target_include_directories(duo_resize_guard_tests PRIVATE
+    src
+)
+
+add_test(NAME duo_resize_guard_tests COMMAND duo_resize_guard_tests)
