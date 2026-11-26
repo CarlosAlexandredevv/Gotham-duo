@@ -43,6 +43,8 @@ jobs:
           Copy-Item "build/Release/version.dll" "$stage/version.dll"
           Copy-Item "config/gothamduo.ini" "$stage/gothamduo.ini"
           Copy-Item "docs/INSTALL.txt" "$stage/INSTALL.txt"
+          Copy-Item "scripts/install.ps1" "$stage/install.ps1"
+          Copy-Item "scripts/install.bat" "$stage/install.bat"
           Copy-Item "LICENSE" "$stage/LICENSE"
 
           $zipName = "gotham-duo-$env:TAG-win64.zip"

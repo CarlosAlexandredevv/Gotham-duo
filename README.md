@@ -72,6 +72,7 @@ These workarounds are not verified for this specific game. Results may vary, and
 │   ├── output/      # Dual-monitor window/swapchain output, resize guard, seam detector
 │   ├── input/       # XInput controller / hotkey Solo↔Duo triggers
 │   └── log.h        # Shared lightweight file logger
+├── scripts/         # install.ps1 / install.bat helper (shipped in releases) and its self-check
 └── tests/           # CTest unit tests
 ```
 
@@ -94,16 +95,29 @@ Dependencies:
 
 ## Installation
 
+### Automatic (recommended)
+
+1. Download and extract the release `.zip` (or use `scripts/` from a source checkout after building).
+2. Close the game, then double-click `install.bat` (or run `install.ps1`) and choose **Install**. It auto-detects Steam and Epic Games Store installs (or asks for the folder), verifies `LEGOBatmanLotDK-Win64-Shipping.exe` is present, copies `version.dll`, keeps your existing `gothamduo.ini`, and never overwrites another mod's `version.dll`.
+   - Non-interactive: `.\install.ps1 -Action Install -GamePath "<install folder>" -NoPrompt` (add `-UpdateConfig` to replace `gothamduo.ini`; a `.bak` copy is kept).
+3. To remove it, run the same script and choose **Uninstall** (`-Action Uninstall`, optionally `-RemoveConfig`).
+
+### Manual
+
 1. Build or download `version.dll` (and optionally [config/gothamduo.ini](config/gothamduo.ini)).
 2. Copy `version.dll` (and `gothamduo.ini` if customizing monitors or controller triggers) next to the shipping executable:
    `LEGOBatmanLotDK\Binaries\Win64\` (alongside `LEGOBatmanLotDK-Win64-Shipping.exe`, **not** the root launcher folder).
-3. Launch the game (Windowed or Borderless mode is recommended). It starts in **Solo mode** on the primary monitor (`1920x1080`).
-4. Switching modes:
+
+### Playing
+
+1. Launch the game (Windowed or Borderless mode is recommended). It starts in **Solo mode** on the primary monitor (`1920x1080`).
+2. Switching modes:
    - **Solo → Duo:** Press `Start` on Controller 2 (auto-detected) or press `F9`.
    - **Duo → Solo:** Hold `Back + Start` on Controller 2 for `800 ms` (configurable) or press `F9`.
    - `F1`: Override mirrored `1920x1080` menu mode manually in Duo mode (press again to return to `Auto`).
    - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080` or `1920x1080`) while in Duo mode.
-5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`). Under `[MenuMirror]`, you can configure `AutoDetect` (`1` default for structural D3D12 auto-mirroring on menus, loading, and cutscenes; `0` for manual `F1` only), `EnterMirrorMs` (default `200`), and `ExitMirrorMs` (default `100`).
+3. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`). Under `[MenuMirror]`, you can configure `AutoDetect` (`1` default for structural D3D12 auto-mirroring on menus, loading, and cutscenes; `0` for manual `F1` only), `EnterMirrorMs` (default `200`), and `ExitMirrorMs` (default `100`).
+
 
 ## Supported monitor configurations
 
