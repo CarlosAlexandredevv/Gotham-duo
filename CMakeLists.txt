@@ -180,3 +180,17 @@ target_include_directories(monitor_layout_tests PRIVATE
 )
 
 add_test(NAME monitor_layout_tests COMMAND monitor_layout_tests)
+
+add_executable(present_policy_tests
+    tests/present_policy_test.cpp
+)
+
+set_target_properties(present_policy_tests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+target_include_directories(present_policy_tests PRIVATE
+    src
+)
+
+add_test(NAME present_policy_tests COMMAND present_policy_tests)

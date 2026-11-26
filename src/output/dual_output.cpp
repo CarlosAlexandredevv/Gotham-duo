@@ -4,6 +4,7 @@
 #include "output/duo_resize_guard.h"
 #include "output/monitor_layout.h"
 #include "output/output_visibility.h"
+#include "output/present_policy.h"
 #include "input/input_trigger.h"
 #include "log.h"
 #include "output/split_seam_detector.h"
@@ -271,6 +272,8 @@ struct DualOutput::Impl {
     std::atomic<bool> alt_tab_active{false};
     std::atomic<bool> windows_visible{false};
     std::atomic<bool> last_game_focused{true};
+    std::atomic<bool> skip_game_present{false};
+    std::atomic<bool> outputs_presented_ok{false};
     InputTrigger input_trigger;
     std::atomic<HWND> game_hwnd{nullptr};
     std::atomic<ULONGLONG> last_present_ms{0};
@@ -671,7 +674,9 @@ struct DualOutput::Impl {
     void CopyAndPresent(IDXGISwapChain3* game_swapchain,
                         ID3D12CommandQueue* game_queue,
                         OrigPresentFn orig_present,
-                        bool is_mirroring) {
+                        bool is_mirroring,
+                        const OutputSync& sync) {
+        outputs_presented_ok.store(false);
         ComPtr<IDXGISwapChain3> sc_out[2];
         ComPtr<ID3D12Device> dev_ref;
         bool tearing = false;
@@ -853,9 +858,15 @@ struct DualOutput::Impl {
         }
 
         // Call original Present outside d3d_mtx to avoid re-entering our MinHook detour under lock.
-        const UINT present_flags = tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        // ALLOW_TEARING is only valid with sync interval 0.
+        bool all_ok = true;
         for (int i = 0; i < 2; ++i) {
-            const HRESULT hr = orig_present(sc_out[i].Get(), 0, present_flags);
+            const UINT interval = sync.sync_interval[i];
+            const UINT present_flags = (tearing && interval == 0) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+            const HRESULT hr = orig_present(sc_out[i].Get(), interval, present_flags);
+            if (FAILED(hr)) {
+                all_ok = false;
+            }
             if (FAILED(hr) && !already_logged_err) {
                 already_logged_err = true;
                 std::lock_guard<std::mutex> lock(d3d_mtx);
@@ -868,6 +879,7 @@ struct DualOutput::Impl {
                 }
             }
         }
+        outputs_presented_ok.store(all_ok);
         if (!has_presented_duo.exchange(true)) {
             NotifyVisibilityChange();
         }
@@ -940,10 +952,14 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
                               ID3D12CommandQueue* game_queue,
                               OrigPresentFn orig_present,
                               std::optional<StripClassification> frame_sample,
-                              const FrameRenderStats* frame_stats) {
+                              const FrameRenderStats* frame_stats,
+                              UINT game_sync_interval,
+                              UINT game_present_flags,
+                              UINT game_swapchain_flags) {
     if (!impl_ || !impl_->has_monitors || !game_swapchain || !game_queue) {
         return;
     }
+    impl_->skip_game_present.store(false);
 
     // Wait until the window thread has created both HWNDs (non-blocking once signaled).
     if (WaitForSingleObject(impl_->windows_ready_event, 0) != WAIT_OBJECT_0) {
@@ -1176,13 +1192,31 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
 
     SetSubtitleSplitActive(
         !want_mirror && actual_w == expected_w && actual_w >= 64, actual_w, actual_h);
-    impl_->CopyAndPresent(game_swapchain, game_queue, orig_present, want_mirror);
+
+    SuppressInput suppress_in{};
+    suppress_in.enabled = impl_->config.performance.suppress_game_present;
+    suppress_in.is_duo = true;
+    suppress_in.outputs_visible = impl_->windows_visible.load();
+    suppress_in.present_flags = game_present_flags;
+    suppress_in.swapchain_flags = game_swapchain_flags;
+    const bool will_suppress = ShouldSuppressGamePresent(suppress_in);
+
+    impl_->CopyAndPresent(game_swapchain,
+                          game_queue,
+                          orig_present,
+                          want_mirror,
+                          ComputeOutputSync(will_suppress, game_sync_interval));
+    impl_->skip_game_present.store(will_suppress && impl_->outputs_presented_ok.load());
 
     const bool window_active =
         !gh || (IsWindow(gh) && IsWindowVisible(gh) && !IsIconic(gh));
     if (window_active && !impl_->windows_visible.load()) {
         impl_->NotifyVisibilityChange();
     }
+}
+
+bool DualOutput::ShouldSkipGamePresent() const {
+    return impl_ && impl_->skip_game_present.load();
 }
 
 void DualOutput::OnGameResizeBuffers(DXGI_FORMAT new_format) {

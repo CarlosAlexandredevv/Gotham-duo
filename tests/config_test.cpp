@@ -41,6 +41,7 @@ void TestDefaultsAndMissingFile() {
     CHECK(cfg.display.solo_height == 0);
     CHECK(cfg.logging.enabled);
     CHECK(!cfg.logging.verbose);
+    CHECK(cfg.performance.suppress_game_present);
     CHECK(cfg.warnings.empty());
 }
 
@@ -101,12 +102,16 @@ void TestValidCustomConfig() {
         "SoloWidth=2560\r\n"
         "SoloHeight=1440\r\n"
         "\r\n"
+        "[Performance]\r\n"
+        "SuppressGamePresent=0\r\n"
+        "\r\n"
         "[Logging]\r\n"
         "Enabled=0\r\n"
         "Verbose=true\r\n";
 
     const AppConfig cfg = ParseConfig(ini);
     CHECK(cfg.warnings.empty());
+    CHECK(!cfg.performance.suppress_game_present);
     CHECK(cfg.monitors.player1 == 1);
     CHECK(cfg.monitors.player2 == 0);
     CHECK(!cfg.input.allow_controller);
@@ -140,6 +145,8 @@ void TestMalformedEntriesFallbackWithWarnings() {
         "ToggleMirrorKey=F99\n"
         "[Display]\n"
         "TargetWidth=-100\n"
+        "[Performance]\n"
+        "SuppressGamePresent=maybe\n"
         "[Logging]\n"
         "Enabled=nope\n";
 
@@ -153,7 +160,8 @@ void TestMalformedEntriesFallbackWithWarnings() {
     CHECK(cfg.hotkeys.toggle_mirror_vk == kDefaultToggleMirrorVk);
     CHECK(cfg.display.target_width == 0);
     CHECK(cfg.logging.enabled);
-    CHECK(cfg.warnings.size() == 9);
+    CHECK(cfg.performance.suppress_game_present);
+    CHECK(cfg.warnings.size() == 10);
 }
 
 }  // namespace
