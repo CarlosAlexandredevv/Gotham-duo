@@ -55,7 +55,9 @@ private:
     std::array<bool, 4> wait_release_after_exit_{};
 };
 
-/// Polls live F9 key state and XInput controller slots 0..3.
-void PollSystemInput(bool& out_f9_down, std::array<ControllerButtons, 4>& out_slots);
+/// Polls live ToggleDuo key state (pass 0 to disable) and XInput controller slots 0..3.
+void PollSystemInput(bool& out_f9_down,
+                     std::array<ControllerButtons, 4>& out_slots,
+                     int toggle_duo_vk = 0x78);
 
 }  // namespace gotham

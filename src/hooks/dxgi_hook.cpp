@@ -159,7 +159,7 @@ void HandleGamePresent(IDXGISwapChain* self) {
 
     const uint64_t frame = ++g_frame_count;
     if (frame % 300 == 0) {
-        Log("DualOutput heartbeat: frame %llu", static_cast<unsigned long long>(frame));
+        gotham::LogVerbose("DualOutput heartbeat: frame %llu", static_cast<unsigned long long>(frame));
     }
 }
 

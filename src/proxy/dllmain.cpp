@@ -1,3 +1,4 @@
+#include "config.h"
 #include "hooks/dxgi_hook.h"
 #include "log.h"
 #include "proxy/version_proxy.h"
@@ -14,8 +15,12 @@ HANDLE g_init_thread = nullptr;
 #endif
 
 DWORD WINAPI InitThreadProc(LPVOID) {
-    gotham::InitLog(g_self_module);
+    const gotham::AppConfig cfg = gotham::LoadConfigForModule(g_self_module);
+    gotham::InitLog(g_self_module, cfg.logging.enabled, cfg.logging.verbose);
     gotham::Log("Gotham Duo v%s loaded into PID %lu", GOTHAMDUO_VERSION_STR, GetCurrentProcessId());
+    for (const auto& warning : cfg.warnings) {
+        gotham::Log("Config warning: %s", warning.c_str());
+    }
     gotham::InitDxgiHook(g_self_module);
     return 0;
 }

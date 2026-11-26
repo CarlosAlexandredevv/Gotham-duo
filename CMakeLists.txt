@@ -152,3 +152,17 @@ target_include_directories(output_visibility_tests PRIVATE
 )
 
 add_test(NAME output_visibility_tests COMMAND output_visibility_tests)
+
+add_executable(config_tests
+    tests/config_test.cpp
+)
+
+set_target_properties(config_tests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+target_include_directories(config_tests PRIVATE
+    src
+)
+
+add_test(NAME config_tests COMMAND config_tests)
