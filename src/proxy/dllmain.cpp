@@ -9,9 +9,13 @@ namespace {
 HMODULE g_self_module = nullptr;
 HANDLE g_init_thread = nullptr;
 
+#ifndef GOTHAMDUO_VERSION_STR
+#define GOTHAMDUO_VERSION_STR "0.0.0-dev"
+#endif
+
 DWORD WINAPI InitThreadProc(LPVOID) {
     gotham::InitLog(g_self_module);
-    gotham::Log("Gotham Duo loaded into PID %lu", GetCurrentProcessId());
+    gotham::Log("Gotham Duo v%s loaded into PID %lu", GOTHAMDUO_VERSION_STR, GetCurrentProcessId());
     gotham::InitDxgiHook(g_self_module);
     return 0;
 }

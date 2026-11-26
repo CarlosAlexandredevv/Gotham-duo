@@ -1,7 +1,19 @@
 cmake_minimum_required(VERSION 3.24)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-project(GothamDuo LANGUAGES CXX ASM_MASM)
+set(GOTHAMDUO_VERSION "0.1.0" CACHE STRING "Gotham Duo version (MAJOR.MINOR.PATCH[-prerelease])")
+string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)" _gothamduo_ver_match "${GOTHAMDUO_VERSION}")
+if(NOT _gothamduo_ver_match)
+    message(FATAL_ERROR "GOTHAMDUO_VERSION must start with MAJOR.MINOR.PATCH, got: ${GOTHAMDUO_VERSION}")
+endif()
+set(GOTHAMDUO_VERSION_MAJOR "${CMAKE_MATCH_1}")
+set(GOTHAMDUO_VERSION_MINOR "${CMAKE_MATCH_2}")
+set(GOTHAMDUO_VERSION_PATCH "${CMAKE_MATCH_3}")
+
+project(GothamDuo
+    VERSION "${GOTHAMDUO_VERSION_MAJOR}.${GOTHAMDUO_VERSION_MINOR}.${GOTHAMDUO_VERSION_PATCH}"
+    LANGUAGES CXX ASM_MASM
+)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,6 +31,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+configure_file(
+    src/proxy/version.rc.in
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+    @ONLY
+)
+
 add_library(gothamduo SHARED
     src/hooks/d3d12_probe.cpp
     src/hooks/dxgi_hook.cpp
@@ -29,6 +47,7 @@ add_library(gothamduo SHARED
     src/proxy/version_proxy.cpp
     src/proxy/version_trampolines.asm
     src/proxy/version.def
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
 )
 
 set_target_properties(gothamduo PROPERTIES
@@ -46,6 +65,7 @@ target_compile_definitions(gothamduo PRIVATE
     NOMINMAX
     UNICODE
     _UNICODE
+    GOTHAMDUO_VERSION_STR="${GOTHAMDUO_VERSION}"
 )
 
 target_link_libraries(gothamduo PRIVATE
