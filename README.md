@@ -29,8 +29,8 @@ The goal is local co-op only. The game has no online or LAN co-op, and this proj
 - [x] Create one borderless window per monitor with its own swapchain
 - [x] Present each half on the correct monitor
 - [x] Automatic Solo/Duo mode switching (starts in Solo; switches to Duo on P2 `Start` or `F9`, returns to Solo on `Back + Start` hold or `F9`)
-- [ ] Suppress the original presentation to avoid duplicates
-- [ ] Config file (monitor selection and input triggers via `gothamduo.ini` work; full hotkey/resolution config pending)
+- [x] Suppress the original presentation to avoid duplicates (in Duo mode, while the output windows are visible, the game's own `Present` is skipped and the first output inherits its VSync/frame pacing; falls back to the normal present in Solo, on `Alt+Tab`/minimize, and for test/waitable-object swapchains; disable with `[Performance] SuppressGamePresent=0`. Needs in-game frame-pacing validation, see #13)
+- [x] Config file (monitor selection, input triggers, hotkeys, display overrides, and logging via `gothamduo.ini`)
 - [x] Handle menus, pause screen, shared camera, and centered subtitles/HUD prompts (menus, loading screens, cutscenes, and shared-camera scenes auto-switch to native `1920x1080` mirrored across both monitors in Duo mode via structural D3D12 detection with `F1` override; centered subtitles and shared HUD banners over active split-screen are replicated onto each monitor via D3D12 Slate draw replay)
 - [ ] Test on Steam (2-controller co-op) and Epic versions
 
@@ -65,16 +65,14 @@ These workarounds are not verified for this specific game. Results may vary, and
 ```text
 ├── config/          # Default gothamduo.ini template shipped with releases
 ├── docs/
-│   ├── design/      # Architecture specs and implementation plans
-│   └── dev/         # Developer testing notes
+│   └── design/      # Architecture specs and implementation plans
 ├── src/
 │   ├── proxy/       # version.dll proxy, MASM trampolines, DLL entry point
 │   ├── hooks/       # DXGI & D3D12 hooks and Slate draw-replay probe
 │   ├── output/      # Dual-monitor window/swapchain output, resize guard, seam detector
 │   ├── input/       # XInput controller / hotkey Solo↔Duo triggers
 │   └── log.h        # Shared lightweight file logger
-├── tests/           # CTest unit tests
-└── tools/           # Local dev helper scripts (not shipped with the mod)
+└── tests/           # CTest unit tests
 ```
 
 ## Building
