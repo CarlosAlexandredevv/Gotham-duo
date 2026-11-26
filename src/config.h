@@ -57,6 +57,11 @@ struct LoggingConfig {
     bool verbose = false;
 };
 
+struct PerformanceConfig {
+    /// In Duo mode, skip the game's own Present while the output windows cover its window.
+    bool suppress_game_present = true;
+};
+
 struct AppConfig {
     MonitorsConfig monitors{};
     InputConfig input{};
@@ -64,6 +69,7 @@ struct AppConfig {
     MirrorConfig mirror{};
     DisplayConfig display{};
     LoggingConfig logging{};
+    PerformanceConfig performance{};
     std::vector<std::string> warnings;
 };
 
@@ -332,6 +338,14 @@ inline AppConfig ParseConfig(std::string_view ini_text) {
                 parse_dim(cfg.display.solo_width);
             } else if (key == "SOLOHEIGHT") {
                 parse_dim(cfg.display.solo_height);
+            }
+        } else if (section == "PERFORMANCE") {
+            if (key == "SUPPRESSGAMEPRESENT") {
+                if (auto v = detail::ParseBoolStrict(val); v.has_value()) {
+                    cfg.performance.suppress_game_present = *v;
+                } else {
+                    warn_invalid("expected 0/1 or true/false");
+                }
             }
         } else if (section == "LOGGING") {
             if (key == "ENABLED") {
