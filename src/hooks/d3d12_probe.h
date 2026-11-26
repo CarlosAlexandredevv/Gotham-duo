@@ -1,6 +1,6 @@
 #pragma once
 
-#include "split_seam_detector.h"
+#include "output/split_seam_detector.h"
 
 #include <d3d12.h>
 

@@ -20,21 +20,25 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 add_library(gothamduo SHARED
-    src/d3d12_probe.cpp
-    src/dllmain.cpp
-    src/dual_output.cpp
-    src/dxgi_hook.cpp
-    src/input_trigger.cpp
-    src/split_seam_detector.cpp
-    src/version_proxy.cpp
-    src/version_trampolines.asm
-    src/version.def
+    src/hooks/d3d12_probe.cpp
+    src/hooks/dxgi_hook.cpp
+    src/input/input_trigger.cpp
+    src/output/dual_output.cpp
+    src/output/split_seam_detector.cpp
+    src/proxy/dllmain.cpp
+    src/proxy/version_proxy.cpp
+    src/proxy/version_trampolines.asm
+    src/proxy/version.def
 )
 
 set_target_properties(gothamduo PROPERTIES
     OUTPUT_NAME "version"
     PREFIX ""
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+target_include_directories(gothamduo PRIVATE
+    src
 )
 
 target_compile_definitions(gothamduo PRIVATE
@@ -55,7 +59,7 @@ enable_testing()
 
 add_executable(gothamduo_tests
     tests/input_trigger_test.cpp
-    src/input_trigger.cpp
+    src/input/input_trigger.cpp
 )
 
 set_target_properties(gothamduo_tests PROPERTIES
@@ -95,7 +99,7 @@ add_test(NAME duo_resize_guard_tests COMMAND duo_resize_guard_tests)
 
 add_executable(split_seam_detector_tests
     tests/split_seam_detector_test.cpp
-    src/split_seam_detector.cpp
+    src/output/split_seam_detector.cpp
 )
 
 set_target_properties(split_seam_detector_tests PROPERTIES

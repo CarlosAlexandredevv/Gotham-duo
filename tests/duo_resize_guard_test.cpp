@@ -1,4 +1,4 @@
-#include "duo_resize_guard.h"
+#include "output/duo_resize_guard.h"
 
 #include <cstdio>
 #include <cstdlib>

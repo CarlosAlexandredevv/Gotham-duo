@@ -60,6 +60,23 @@ Before this project is usable, you can test a similar effect with no code:
 
 These workarounds are not verified for this specific game. Results may vary, and menus and HUD will span both monitors.
 
+## Project structure
+
+```text
+├── config/          # Default gothamduo.ini template shipped with releases
+├── docs/
+│   ├── design/      # Architecture specs and implementation plans
+│   └── dev/         # Developer testing notes
+├── src/
+│   ├── proxy/       # version.dll proxy, MASM trampolines, DLL entry point
+│   ├── hooks/       # DXGI & D3D12 hooks and Slate draw-replay probe
+│   ├── output/      # Dual-monitor window/swapchain output, resize guard, seam detector
+│   ├── input/       # XInput controller / hotkey Solo↔Duo triggers
+│   └── log.h        # Shared lightweight file logger
+├── tests/           # CTest unit tests
+└── tools/           # Local dev helper scripts (not shipped with the mod)
+```
+
 ## Building
 
 ```bash

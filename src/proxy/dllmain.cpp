@@ -1,6 +1,6 @@
-#include "dxgi_hook.h"
+#include "hooks/dxgi_hook.h"
 #include "log.h"
-#include "version_proxy.h"
+#include "proxy/version_proxy.h"
 
 #include <Windows.h>
 
