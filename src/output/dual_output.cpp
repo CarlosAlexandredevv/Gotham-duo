@@ -1,6 +1,7 @@
 #include "output/dual_output.h"
 #include "hooks/d3d12_probe.h"
 #include "output/duo_resize_guard.h"
+#include "output/output_visibility.h"
 #include "input/input_trigger.h"
 #include "log.h"
 #include "output/split_seam_detector.h"
@@ -266,6 +267,9 @@ struct DualOutput::Impl {
     DuoResizeGuard duo_resize_guard{};
     std::atomic<OutputMode> mode{OutputMode::Solo};
     std::atomic<bool> has_presented_duo{false};
+    std::atomic<bool> alt_tab_active{false};
+    std::atomic<bool> windows_visible{false};
+    std::atomic<bool> last_game_focused{true};
     InputTrigger input_trigger;
     std::atomic<HWND> game_hwnd{nullptr};
     std::atomic<ULONGLONG> last_present_ms{0};
@@ -296,6 +300,37 @@ struct DualOutput::Impl {
         } else if (win_thread_id != 0) {
             PostThreadMessageW(win_thread_id, kMsgSetVisible, 0, 0);
         }
+    }
+
+    inline static thread_local Impl* t_win_thread_impl = nullptr;
+
+    static void CALLBACK WinEventProc(HWINEVENTHOOK,
+                                      DWORD event,
+                                      HWND hwnd,
+                                      LONG,
+                                      LONG,
+                                      DWORD,
+                                      DWORD) {
+        auto* self = t_win_thread_impl;
+        if (!self) {
+            return;
+        }
+        if (event == EVENT_SYSTEM_SWITCHSTART) {
+            self->alt_tab_active.store(true);
+        } else if (event == EVENT_SYSTEM_SWITCHEND) {
+            self->alt_tab_active.store(false);
+        } else if (event == EVENT_SYSTEM_FOREGROUND) {
+            const HWND gh = self->game_hwnd.load();
+            if (gh && hwnd == gh) {
+                self->alt_tab_active.store(false);
+            }
+        } else if (event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND) {
+            const HWND gh = self->game_hwnd.load();
+            if (gh && hwnd != gh) {
+                return;
+            }
+        }
+        self->NotifyVisibilityChange();
     }
 
     static DWORD WINAPI WindowThreadProc(LPVOID param) {
@@ -334,6 +369,31 @@ struct DualOutput::Impl {
                 targets[i]->height());
         }
 
+        t_win_thread_impl = self;
+        HWINEVENTHOOK event_hooks[3] = {
+            SetWinEventHook(EVENT_SYSTEM_FOREGROUND,
+                            EVENT_SYSTEM_FOREGROUND,
+                            nullptr,
+                            &Impl::WinEventProc,
+                            0,
+                            0,
+                            WINEVENT_OUTOFCONTEXT),
+            SetWinEventHook(EVENT_SYSTEM_SWITCHSTART,
+                            EVENT_SYSTEM_SWITCHEND,
+                            nullptr,
+                            &Impl::WinEventProc,
+                            0,
+                            0,
+                            WINEVENT_OUTOFCONTEXT),
+            SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART,
+                            EVENT_SYSTEM_MINIMIZEEND,
+                            nullptr,
+                            &Impl::WinEventProc,
+                            0,
+                            0,
+                            WINEVENT_OUTOFCONTEXT),
+        };
+
         SetEvent(self->windows_ready_event);
         if (self->hwnd[0]) {
             SetTimer(self->hwnd[0], 1, 200, nullptr);
@@ -342,23 +402,38 @@ struct DualOutput::Impl {
         bool currently_visible = false;
         auto sync_visibility = [&]() {
             const HWND gh = self->game_hwnd.load();
-            const ULONGLONG last_ms = self->last_present_ms.load();
             const HWND fg = GetForegroundWindow();
-            const bool game_focused =
-                (!gh || fg == gh || fg == self->hwnd[0] || fg == self->hwnd[1]);
-            const bool game_active =
-                (!gh || (IsWindow(gh) && IsWindowVisible(gh) && !IsIconic(gh))) &&
-                (last_ms == 0 || (GetTickCount64() - last_ms) < 1500);
-            const bool show = (self->mode.load() == OutputMode::Duo) &&
-                              self->has_presented_duo.load() && game_active && game_focused;
+            OutputVisibilityInput vis{};
+            vis.is_duo = (self->mode.load() == OutputMode::Duo);
+            vis.has_presented_duo = self->has_presented_duo.load();
+            vis.has_game_window = (gh != nullptr);
+            vis.game_window_visible = gh && IsWindow(gh) && IsWindowVisible(gh);
+            vis.game_window_minimized = gh && IsIconic(gh);
+            vis.game_focused = IsGameWindowFocused(fg, gh, self->hwnd[0], self->hwnd[1]);
+            vis.alt_tab_active = self->alt_tab_active.load();
+            vis.last_present_ms = self->last_present_ms.load();
+            vis.now_ms = GetTickCount64();
+
+            const bool show = ShouldShowDuoOutput(vis);
             if (show == currently_visible) {
                 return;
             }
             currently_visible = show;
-            const int cmd = show ? SW_SHOWNOACTIVATE : SW_HIDE;
+            self->windows_visible.store(show);
             for (int i = 0; i < 2; ++i) {
-                if (self->hwnd[i]) {
-                    ShowWindow(self->hwnd[i], cmd);
+                if (!self->hwnd[i]) {
+                    continue;
+                }
+                if (show) {
+                    SetWindowPos(self->hwnd[i],
+                                 HWND_TOPMOST,
+                                 0,
+                                 0,
+                                 0,
+                                 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                } else {
+                    ShowWindow(self->hwnd[i], SW_HIDE);
                 }
             }
         };
@@ -373,6 +448,14 @@ struct DualOutput::Impl {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+
+        for (HWINEVENTHOOK hook : event_hooks) {
+            if (hook) {
+                UnhookWinEvent(hook);
+            }
+        }
+        t_win_thread_impl = nullptr;
+        self->windows_visible.store(false);
 
         if (self->hwnd[0]) {
             KillTimer(self->hwnd[0], 1);
@@ -814,7 +897,25 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         HWND queried = nullptr;
         if (SUCCEEDED(game_swapchain->GetHwnd(&queried)) && queried) {
             impl_->game_hwnd.store(queried);
+            gh = queried;
         }
+    }
+
+    const HWND fg = GetForegroundWindow();
+    const bool game_focused =
+        !impl_->alt_tab_active.load() &&
+        IsGameWindowFocused(fg, gh, impl_->hwnd[0], impl_->hwnd[1]);
+    const bool prev_focused = impl_->last_game_focused.exchange(game_focused);
+    if (game_focused != prev_focused) {
+        if (game_focused) {
+            impl_->duo_resize_guard.Reset();
+        }
+        impl_->NotifyVisibilityChange();
+    }
+    if (!game_focused) {
+        (void)GetAsyncKeyState(VK_F10);
+        SetSubtitleSplitActive(false, 0, 0);
+        return;
     }
 
     bool f9_down = false;
@@ -1001,6 +1102,12 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
 
     SetSubtitleSplitActive(!want_mirror && actual_w >= 3000, actual_w, actual_h);
     impl_->CopyAndPresent(game_swapchain, game_queue, orig_present, want_mirror);
+
+    const bool window_active =
+        !gh || (IsWindow(gh) && IsWindowVisible(gh) && !IsIconic(gh));
+    if (window_active && !impl_->windows_visible.load()) {
+        impl_->NotifyVisibilityChange();
+    }
 }
 
 void DualOutput::OnGameResizeBuffers(DXGI_FORMAT new_format) {
