@@ -25,11 +25,20 @@ public:
     void Start(HMODULE self_module);
 
     /// Copies left/right halves (or mirrored full frame) of game_swapchain and presents both monitors.
+    /// `game_sync_interval`/`game_present_flags`/`game_swapchain_flags` describe the game's own pending
+    /// Present so the outputs can take over its pacing; see ShouldSkipGamePresent().
     void PresentFrame(IDXGISwapChain3* game_swapchain,
                       ID3D12CommandQueue* game_queue,
                       OrigPresentFn orig_present,
                       std::optional<StripClassification> frame_sample = std::nullopt,
-                      const FrameRenderStats* frame_stats = nullptr);
+                      const FrameRenderStats* frame_stats = nullptr,
+                      UINT game_sync_interval = 0,
+                      UINT game_present_flags = 0,
+                      UINT game_swapchain_flags = 0);
+
+    /// True when the last PresentFrame fully presented both Duo outputs over the game window, so the
+    /// game's own (redundant) Present should be skipped. Always false in Solo/hidden/unfocused states.
+    bool ShouldSkipGamePresent() const;
 
     /// Flushes in-flight copy work on game ResizeBuffers while keeping output swapchains alive.
     void OnGameResizeBuffers(DXGI_FORMAT new_format);

@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest an idea or improvement for Gotham Duo
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation or limitation you ran into.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+      description: Describe the behavior or option you have in mind (and any alternatives you considered).
+    validations:
+      required: true
+  - type: dropdown
+    id: storefront
+    attributes:
+      label: Store
+      options: [Steam, Epic Games Store, Other]
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup (optional)
+      description: GPU, monitor resolutions/scaling, and arrangement if relevant to the request.

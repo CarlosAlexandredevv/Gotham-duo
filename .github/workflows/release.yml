@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag -replace '^v', ''
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Configure (x64)
+        run: cmake -B build -A x64 -DGOTHAMDUO_VERSION="${{ steps.meta.outputs.version }}"
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Test (Release)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package release archive and checksums
+        shell: pwsh
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $stage = "dist/package"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item "build/Release/version.dll" "$stage/version.dll"
+          Copy-Item "config/gothamduo.ini" "$stage/gothamduo.ini"
+          Copy-Item "docs/INSTALL.txt" "$stage/INSTALL.txt"
+          Copy-Item "scripts/install.ps1" "$stage/install.ps1"
+          Copy-Item "scripts/install.bat" "$stage/install.bat"
+          Copy-Item "LICENSE" "$stage/LICENSE"
+
+          $zipName = "gotham-duo-$env:TAG-win64.zip"
+          $zipPath = "dist/$zipName"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zipPath -Force
+
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -Path "dist/SHA256SUMS.txt" -Encoding ascii
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $zipPath = "dist/gotham-duo-$env:TAG-win64.zip"
+          $args = @(
+            'release', 'create', $env:TAG,
+            $zipPath,
+            'dist/SHA256SUMS.txt',
+            '--title', "Gotham Duo $env:TAG",
+            '--generate-notes'
+          )
+          if ($env:TAG -match '-') {
+            $args += '--prerelease'
+          }
+          gh @args

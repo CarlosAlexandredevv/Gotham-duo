@@ -1,0 +1,44 @@
+Gotham Duo - Dual-monitor local co-op mod for LEGO Batman: Legacy of the Dark Knight
+======================================================================================
+
+INSTALL (automatic, recommended)
+--------------------------------
+1. Extract this whole archive anywhere (for example your Desktop).
+2. Close the game, then double-click install.bat and choose [1] Install.
+   - It finds your Steam or Epic Games Store install automatically (or asks for the folder).
+   - It checks that LEGOBatmanLotDK-Win64-Shipping.exe is there before copying anything.
+   - An existing gothamduo.ini is kept; run "install.ps1 -UpdateConfig" to replace it
+     (a gothamduo.ini.bak backup is saved).
+   - A different version.dll from another mod is never overwritten.
+3. Launch the game (Windowed or Borderless mode is recommended).
+
+INSTALL (manual)
+----------------
+1. Locate the game's shipping binary folder:
+     <Game Install Folder>\LEGOBatmanLotDK\Binaries\Win64\
+   (This folder contains LEGOBatmanLotDK-Win64-Shipping.exe - do NOT extract to the root launcher folder.)
+2. Copy version.dll and gothamduo.ini from this archive into that folder.
+3. Launch the game (Windowed or Borderless mode is recommended).
+
+CONTROLS
+--------
+- Solo -> Duo:        Press Start on Controller 2, or press F9
+- Duo -> Solo:        Hold Back + Start on Controller 2 for 800 ms, or press F9
+- Menu mirror toggle: Press F1 in Duo mode (overrides automatic menu mirroring)
+- Re-apply resize:    Press F10 in Duo mode
+(Hotkeys can be rebound or disabled in gothamduo.ini under [Hotkeys].)
+
+CONFIGURATION & LOGS
+--------------------
+- Edit gothamduo.ini to customize monitors, controller triggers, hotkeys, display overrides, and logging.
+- Check gothamduo.log in the same folder for the mod version, detected monitors, and diagnostics.
+
+UNINSTALL
+---------
+Automatic: close the game, double-click install.bat and choose [2] Uninstall
+(removes version.dll and gothamduo.log; asks before deleting gothamduo.ini).
+
+Manual: delete these files from LEGOBatmanLotDK\Binaries\Win64\:
+  - version.dll
+  - gothamduo.ini
+  - gothamduo.log (generated at runtime)

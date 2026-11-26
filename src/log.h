@@ -18,9 +18,15 @@ inline FILE*& LogFile() {
     return file;
 }
 
-inline void InitLog(HMODULE self_module) {
+inline bool& LogVerboseEnabled() {
+    static bool verbose = false;
+    return verbose;
+}
+
+inline void InitLog(HMODULE self_module, bool enabled = true, bool verbose = false) {
     std::lock_guard<std::mutex> lock(LogMutex());
-    if (LogFile()) {
+    LogVerboseEnabled() = enabled && verbose;
+    if (!enabled || LogFile()) {
         return;
     }
 
@@ -35,8 +41,7 @@ inline void InitLog(HMODULE self_module) {
     LogFile() = _wfsopen(path, L"w", _SH_DENYNO);
 }
 
-inline void Log(const char* fmt, ...) {
-    std::lock_guard<std::mutex> lock(LogMutex());
+inline void LogV(const char* fmt, va_list args) {
     FILE* f = LogFile();
     if (!f) {
         return;
@@ -45,14 +50,28 @@ inline void Log(const char* fmt, ...) {
     SYSTEMTIME st{};
     GetLocalTime(&st);
     std::fprintf(f, "[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-    va_list args;
-    va_start(args, fmt);
     std::vfprintf(f, fmt, args);
-    va_end(args);
-
     std::fputc('\n', f);
     std::fflush(f);
+}
+
+inline void Log(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(LogMutex());
+    va_list args;
+    va_start(args, fmt);
+    LogV(fmt, args);
+    va_end(args);
+}
+
+inline void LogVerbose(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(LogMutex());
+    if (!LogVerboseEnabled()) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    LogV(fmt, args);
+    va_end(args);
 }
 
 inline void ShutdownLog() {

@@ -119,7 +119,9 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(
     return hr;
 }
 
-void HandleGamePresent(IDXGISwapChain* self) {
+/// Returns true when the Duo outputs fully presented this frame and the game's own Present should
+/// be skipped (it is hidden underneath the output windows).
+bool HandleGamePresent(IDXGISwapChain* self, UINT sync_interval, UINT present_flags) {
     ComPtr<IDXGISwapChain3> sc3;
     ComPtr<ID3D12CommandQueue> queue;
     {
@@ -136,14 +138,16 @@ void HandleGamePresent(IDXGISwapChain* self) {
                 static_cast<void*>(self),
                 static_cast<void*>(g_game_swapchain.Get()));
         }
-        return;
+        return false;
     }
 
     std::optional<gotham::StripClassification> frame_sample;
     gotham::FrameRenderStats stats{};
     bool has_stats = false;
+    UINT swapchain_flags = 0;
     DXGI_SWAP_CHAIN_DESC1 sc_desc{};
     if (SUCCEEDED(sc3->GetDesc1(&sc_desc))) {
+        swapchain_flags = sc_desc.Flags;
         stats = gotham::ConsumeFrameRenderStats(queue.Get(), sc_desc.Width, sc_desc.Height);
         frame_sample = gotham::ClassifyFrameStats(stats);
         has_stats = true;
@@ -151,20 +155,29 @@ void HandleGamePresent(IDXGISwapChain* self) {
 
     g_in_internal_create = true;
     gotham::SetD3D12InternalCall(true);
-    g_dual_output.PresentFrame(
-        sc3.Get(), queue.Get(), g_orig_present, frame_sample, has_stats ? &stats : nullptr);
+    g_dual_output.PresentFrame(sc3.Get(),
+                               queue.Get(),
+                               g_orig_present,
+                               frame_sample,
+                               has_stats ? &stats : nullptr,
+                               sync_interval,
+                               present_flags,
+                               swapchain_flags);
     gotham::SetD3D12InternalCall(false);
     g_in_internal_create = false;
     gotham::TickD3D12ProbeOnPresent(queue.Get(), false);
 
     const uint64_t frame = ++g_frame_count;
     if (frame % 300 == 0) {
-        Log("DualOutput heartbeat: frame %llu", static_cast<unsigned long long>(frame));
+        gotham::LogVerbose("DualOutput heartbeat: frame %llu", static_cast<unsigned long long>(frame));
     }
+    return g_dual_output.ShouldSkipGamePresent();
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* self, UINT sync_interval, UINT flags) {
-    HandleGamePresent(self);
+    if (HandleGamePresent(self, sync_interval, flags)) {
+        return S_OK;
+    }
     return g_orig_present(self, sync_interval, flags);
 }
 
@@ -172,7 +185,9 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* self,
                                        UINT sync_interval,
                                        UINT present_flags,
                                        const DXGI_PRESENT_PARAMETERS* params) {
-    HandleGamePresent(self);
+    if (HandleGamePresent(self, sync_interval, present_flags)) {
+        return S_OK;
+    }
     return g_orig_present1(self, sync_interval, present_flags, params);
 }
 

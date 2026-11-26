@@ -1,0 +1,68 @@
+name: Bug report
+description: Something isn't working in Gotham Duo
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please read the [Player Guide troubleshooting section](https://github.com/CarlosAlexandredevv/Gotham-duo/blob/main/docs/USER_GUIDE.md#5-troubleshooting--faq) first.
+        **Attach `gothamduo.log`** (from `LEGOBatmanLotDK\Binaries\Win64\`) - it contains the mod version and detected monitors.
+  - type: input
+    id: version
+    attributes:
+      label: Gotham Duo version
+      description: Shown on the first line of gothamduo.log (e.g. 0.2.0).
+    validations:
+      required: true
+  - type: dropdown
+    id: storefront
+    attributes:
+      label: Store
+      options: [Steam, Epic Games Store, Other]
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: NVIDIA RTX 3070, driver 560.94
+    validations:
+      required: true
+  - type: textarea
+    id: monitors
+    attributes:
+      label: Monitor setup
+      description: Resolution, refresh rate, Windows scaling % and arrangement of each monitor, plus Windows display mode (Extend).
+      placeholder: |
+        Monitor 1: 2560x1440 @144 Hz, 125% scaling (left)
+        Monitor 2: 1920x1080 @60 Hz, 100% scaling (right)
+    validations:
+      required: true
+  - type: dropdown
+    id: display_mode
+    attributes:
+      label: Game display mode
+      options: [Borderless, Windowed, Fullscreen, Not sure]
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead? Include steps to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: gothamduo.log
+      description: Paste the contents (or drag the file into this box).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: ini
+    attributes:
+      label: gothamduo.ini changes (optional)
+      description: Paste your gothamduo.ini if you edited it.
+      render: ini
