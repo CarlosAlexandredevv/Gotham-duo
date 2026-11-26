@@ -1,4 +1,5 @@
 #include "output/dual_output.h"
+#include "config.h"
 #include "hooks/d3d12_probe.h"
 #include "output/duo_resize_guard.h"
 #include "output/output_visibility.h"
@@ -41,57 +42,6 @@ struct MonitorDesc {
     LONG height() const { return rect.bottom - rect.top; }
 };
 
-bool BuildIniPath(HMODULE self_module, wchar_t (&out_path)[MAX_PATH]) {
-    out_path[0] = L'\0';
-    const DWORD len = GetModuleFileNameW(self_module, out_path, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
-        out_path[0] = L'\0';
-        return false;
-    }
-    wchar_t* slash = wcsrchr(out_path, L'\\');
-    if (!slash ||
-        (MAX_PATH - static_cast<size_t>(slash + 1 - out_path)) < _countof(L"gothamduo.ini")) {
-        out_path[0] = L'\0';
-        return false;
-    }
-    wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - out_path), L"gothamduo.ini");
-    return true;
-}
-
-InputConfig LoadInputConfig(HMODULE self_module) {
-    InputConfig cfg{};
-    wchar_t ini_path[MAX_PATH] = {};
-    if (!BuildIniPath(self_module, ini_path)) {
-        return cfg;
-    }
-
-    cfg.allow_controller =
-        GetPrivateProfileIntW(L"Input", L"AllowControllerToggle", 1, ini_path) != 0;
-    cfg.p2_controller_index = static_cast<int>(
-        GetPrivateProfileIntW(L"Input", L"P2ControllerIndex", -1, ini_path));
-    const int hold_ms = static_cast<int>(
-        GetPrivateProfileIntW(L"Input", L"HoldBackStartMs", 800, ini_path));
-    cfg.hold_back_start_ms = static_cast<uint32_t>(hold_ms <= 0 ? 800 : hold_ms);
-    return cfg;
-}
-
-MirrorConfig LoadMirrorConfig(HMODULE self_module) {
-    MirrorConfig cfg{};
-    wchar_t ini_path[MAX_PATH] = {};
-    if (!BuildIniPath(self_module, ini_path)) {
-        return cfg;
-    }
-
-    cfg.auto_detect = GetPrivateProfileIntW(L"MenuMirror", L"AutoDetect", 1, ini_path) != 0;
-    const int enter_ms = static_cast<int>(
-        GetPrivateProfileIntW(L"MenuMirror", L"EnterMirrorMs", 200, ini_path));
-    const int exit_ms = static_cast<int>(
-        GetPrivateProfileIntW(L"MenuMirror", L"ExitMirrorMs", 100, ini_path));
-    cfg.enter_mirror_ms = static_cast<uint32_t>(enter_ms < 0 ? 200 : enter_ms);
-    cfg.exit_mirror_ms = static_cast<uint32_t>(exit_ms < 0 ? 100 : exit_ms);
-    return cfg;
-}
-
 BOOL CALLBACK EnumMonitorProc(HMONITOR hmon, HDC, LPRECT, LPARAM lparam) {
     auto* list = reinterpret_cast<std::vector<MonitorDesc>*>(lparam);
     MONITORINFOEXW mi{};
@@ -123,7 +73,7 @@ std::vector<MonitorDesc> QueryMonitors() {
     return monitors;
 }
 
-bool SelectTargetMonitors(HMODULE self_module,
+bool SelectTargetMonitors(const MonitorsConfig& mon_cfg,
                           const std::vector<MonitorDesc>& monitors,
                           MonitorDesc& out_solo,
                           MonitorDesc& out_p1,
@@ -133,13 +83,8 @@ bool SelectTargetMonitors(HMODULE self_module,
         return false;
     }
 
-    wchar_t ini_path[MAX_PATH] = {};
-    int cfg_p1 = -1;
-    int cfg_p2 = -1;
-    if (BuildIniPath(self_module, ini_path)) {
-        cfg_p1 = static_cast<int>(GetPrivateProfileIntW(L"Monitors", L"Player1", -1, ini_path));
-        cfg_p2 = static_cast<int>(GetPrivateProfileIntW(L"Monitors", L"Player2", -1, ini_path));
-    }
+    const int cfg_p1 = mon_cfg.player1;
+    const int cfg_p2 = mon_cfg.player2;
     if (cfg_p1 >= 0 && cfg_p2 >= 0 && cfg_p1 != cfg_p2 &&
         static_cast<size_t>(cfg_p1) < monitors.size() &&
         static_cast<size_t>(cfg_p2) < monitors.size()) {
@@ -148,6 +93,10 @@ bool SelectTargetMonitors(HMODULE self_module,
         Log("Using gothamduo.ini monitors: Player1=%d (%ls), Player2=%d (%ls)",
             cfg_p1, out_p1.device, cfg_p2, out_p2.device);
     } else {
+        if (cfg_p1 >= 0 || cfg_p2 >= 0) {
+            Log("Config warning: [Monitors] Player1=%d Player2=%d is out of range or identical (found %zu monitors); auto-selecting.",
+                cfg_p1, cfg_p2, monitors.size());
+        }
         // Auto-select landscape monitors ordered left-to-right so left half sits on the left monitor.
         std::vector<size_t> candidates;
         for (size_t i = 0; i < monitors.size(); ++i) {
@@ -204,12 +153,23 @@ LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-RECT ComputeDualSpanRect(const MonitorDesc& p1, const MonitorDesc& p2) {
+RECT ComputeDualSpanRect(const MonitorDesc& p1,
+                         const MonitorDesc& p2,
+                         const DisplayConfig& display) {
     const LONG left = (std::min)(p1.rect.left, p2.rect.left);
     const LONG top = (std::min)(p1.rect.top, p2.rect.top);
-    const LONG width = p1.width() + p2.width();
-    const LONG height = (std::min)(p1.height(), p2.height());
+    const LONG width = display.target_width > 0 ? static_cast<LONG>(display.target_width)
+                                                : (p1.width() + p2.width());
+    const LONG height = display.target_height > 0 ? static_cast<LONG>(display.target_height)
+                                                  : (std::min)(p1.height(), p2.height());
     return RECT{left, top, left + width, top + height};
+}
+
+RECT ComputeSoloRect(const MonitorDesc& solo, const DisplayConfig& display) {
+    const LONG width = display.solo_width > 0 ? static_cast<LONG>(display.solo_width) : solo.width();
+    const LONG height =
+        display.solo_height > 0 ? static_cast<LONG>(display.solo_height) : solo.height();
+    return RECT{solo.rect.left, solo.rect.top, solo.rect.left + width, solo.rect.top + height};
 }
 
 void ResizeGameWindowToRect(HWND gh, const RECT& rect, const char* reason) {
@@ -246,6 +206,7 @@ void ResizeGameWindowToRect(HWND gh, const RECT& rect, const char* reason) {
 
 struct DualOutput::Impl {
     HMODULE self_module = nullptr;
+    AppConfig config{};
     MonitorDesc mon_solo{};
     MonitorDesc mon_p1{};
     MonitorDesc mon_p2{};
@@ -860,12 +821,26 @@ void DualOutput::Start(HMODULE self_module) {
     }
     impl_ = new Impl();
     impl_->self_module = self_module;
-    impl_->input_trigger.SetConfig(LoadInputConfig(self_module));
-    impl_->mirror_state.SetConfig(LoadMirrorConfig(self_module));
+    impl_->config = LoadConfigForModule(self_module);
+    impl_->input_trigger.SetConfig(impl_->config.input);
+    impl_->mirror_state.SetConfig(impl_->config.mirror);
+
+    Log("Hotkeys: ToggleDuo=0x%02X ToggleMirror=0x%02X ReapplyResize=0x%02X (0=disabled)",
+        impl_->config.hotkeys.toggle_duo_vk,
+        impl_->config.hotkeys.toggle_mirror_vk,
+        impl_->config.hotkeys.reapply_resize_vk);
+    if (impl_->config.display.target_width > 0 || impl_->config.display.target_height > 0 ||
+        impl_->config.display.solo_width > 0 || impl_->config.display.solo_height > 0) {
+        Log("Display overrides: Duo=%ux%u Solo=%ux%u (0=auto)",
+            impl_->config.display.target_width,
+            impl_->config.display.target_height,
+            impl_->config.display.solo_width,
+            impl_->config.display.solo_height);
+    }
 
     const auto monitors = QueryMonitors();
-    impl_->has_monitors =
-        SelectTargetMonitors(self_module, monitors, impl_->mon_solo, impl_->mon_p1, impl_->mon_p2);
+    impl_->has_monitors = SelectTargetMonitors(
+        impl_->config.monitors, monitors, impl_->mon_solo, impl_->mon_p1, impl_->mon_p2);
     if (!impl_->has_monitors) {
         return;
     }
@@ -913,17 +888,20 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         impl_->NotifyVisibilityChange();
     }
     if (!game_focused) {
-        (void)GetAsyncKeyState(VK_F10);
+        if (impl_->config.hotkeys.reapply_resize_vk > 0) {
+            (void)GetAsyncKeyState(impl_->config.hotkeys.reapply_resize_vk);
+        }
         SetSubtitleSplitActive(false, 0, 0);
         return;
     }
 
     bool f9_down = false;
     std::array<ControllerButtons, 4> slots{};
-    PollSystemInput(f9_down, slots);
+    PollSystemInput(f9_down, slots, impl_->config.hotkeys.toggle_duo_vk);
 
     const ULONGLONG now_ms = GetTickCount64();
-    const bool f1_down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+    const int mirror_vk = impl_->config.hotkeys.toggle_mirror_vk;
+    const bool f1_down = (mirror_vk > 0) && ((GetAsyncKeyState(mirror_vk) & 0x8000) != 0);
     const bool is_duo = impl_->mode.load() == OutputMode::Duo;
     TriggerAction action =
         impl_->input_trigger.Update(is_duo, f9_down, slots, now_ms);
@@ -966,7 +944,10 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
             impl_->mirror_state.Reset(false);
             impl_->split_join_detector.Reset(true);
         }
-        ResizeGameWindowToRect(impl_->game_hwnd.load(), impl_->mon_solo.rect, "solo");
+        ResizeGameWindowToRect(
+            impl_->game_hwnd.load(),
+            ComputeSoloRect(impl_->mon_solo, impl_->config.display),
+            "solo");
         Log("Mode switched to SOLO");
     }
 
@@ -1026,7 +1007,8 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
     }
 
     const RECT target_rect =
-        want_mirror ? impl_->mon_solo.rect : ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
+        want_mirror ? ComputeSoloRect(impl_->mon_solo, impl_->config.display)
+                    : ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2, impl_->config.display);
     const UINT expected_w = static_cast<UINT>(target_rect.right - target_rect.left);
     const UINT expected_h = static_cast<UINT>(target_rect.bottom - target_rect.top);
 
@@ -1080,7 +1062,8 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         impl_->NotifyVisibilityChange();
     }
 
-    if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
+    const int reapply_vk = impl_->config.hotkeys.reapply_resize_vk;
+    if (reapply_vk > 0 && (GetAsyncKeyState(reapply_vk) & 1) != 0) {
         impl_->duo_resize_guard.Reset();
         impl_->duo_resize_guard.NoteResizeRequested(now_ms);
         ResizeGameWindowToRect(

@@ -86,8 +86,10 @@ TriggerAction InputTrigger::Update(bool is_duo,
     return action;
 }
 
-void PollSystemInput(bool& out_f9_down, std::array<ControllerButtons, 4>& out_slots) {
-    out_f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+void PollSystemInput(bool& out_f9_down,
+                     std::array<ControllerButtons, 4>& out_slots,
+                     int toggle_duo_vk) {
+    out_f9_down = (toggle_duo_vk > 0) && ((GetAsyncKeyState(toggle_duo_vk) & 0x8000) != 0);
 
     using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
     static const XInputGetStateFn xinput_get_state = []() -> XInputGetStateFn {
