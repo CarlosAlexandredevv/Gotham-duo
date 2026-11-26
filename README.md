@@ -20,6 +20,8 @@ LEGO Batman: Legacy of the Dark Knight lets two players explore the open world w
 
 The goal is local co-op only. The game has no online or LAN co-op, and this project does not add any.
 
+> **Players:** start with the [Player Guide](docs/USER_GUIDE.md) for step-by-step install/uninstall, controls, every `gothamduo.ini` option, and troubleshooting. Found a bug? [Open an issue](https://github.com/CarlosAlexandredevv/Gotham-duo/issues/new/choose) and attach `gothamduo.log`.
+
 ## Status
 
 **Early prototype (Steam D3D12 validated).** Core Solo/Duo switching and dual-monitor capture/presentation are working on Steam (`1920x1080` Solo on the primary monitor, switching to `3840x1080` split across two `1920x1080` monitors in Duo mode); two-controller co-op gameplay, menu polish, and Epic Games Store remain to be tested.
@@ -46,7 +48,7 @@ The game runs one instance and draws a vertical split screen (player 1 on the le
 
 - Windows 10/11, x64
 - LEGO Batman: Legacy of the Dark Knight (PC, Steam or Epic Games Store)
-- Two monitors, ideally with the same resolution
+- Two monitors (any resolution; see [Supported monitor configurations](#supported-monitor-configurations))
 - Two controllers
 - A GPU able to handle the extra copy work at your target resolution
 
@@ -65,6 +67,7 @@ These workarounds are not verified for this specific game. Results may vary, and
 ```text
 ├── config/          # Default gothamduo.ini template shipped with releases
 ├── docs/
+│   ├── USER_GUIDE.md  # Player-facing install, controls, config reference, FAQ
 │   └── design/      # Architecture specs and implementation plans
 ├── src/
 │   ├── proxy/       # version.dll proxy, MASM trampolines, DLL entry point
@@ -94,6 +97,8 @@ Dependencies:
 - [MinHook](https://github.com/TsudaKageyu/minhook) `v1.3.4` (fetched automatically by CMake `FetchContent`)
 
 ## Installation
+
+> Quick version below; the [Player Guide](docs/USER_GUIDE.md) has exact Steam/Epic paths, a full `gothamduo.ini` reference, and an FAQ.
 
 ### Automatic (recommended)
 
