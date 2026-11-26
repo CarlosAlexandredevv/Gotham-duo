@@ -166,3 +166,17 @@ target_include_directories(config_tests PRIVATE
 )
 
 add_test(NAME config_tests COMMAND config_tests)
+
+add_executable(monitor_layout_tests
+    tests/monitor_layout_test.cpp
+)
+
+set_target_properties(monitor_layout_tests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+target_include_directories(monitor_layout_tests PRIVATE
+    src
+)
+
+add_test(NAME monitor_layout_tests COMMAND monitor_layout_tests)

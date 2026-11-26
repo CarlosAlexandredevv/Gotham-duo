@@ -107,6 +107,18 @@ Dependencies:
    - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080` or `1920x1080`) while in Duo mode.
 5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`). Under `[MenuMirror]`, you can configure `AutoDetect` (`1` default for structural D3D12 auto-mirroring on menus, loading, and cutscenes; `0` for manual `F1` only), `EnterMirrorMs` (default `200`), and `ExitMirrorMs` (default `100`).
 
+## Supported monitor configurations
+
+Gotham Duo no longer assumes two `1920x1080` monitors:
+
+- **Resolution:** Both players render at the **smaller** of the two monitors' resolutions (for example `1440p` + `1080p` → each player renders `1920x1080`, span `3840x1080`), so neither half is ever cropped. Each output is scaled onto its own monitor; if the aspect ratio differs (ultrawide, portrait), it is letterboxed/pillarboxed and centered on a black backdrop.
+- **Menus / mirror mode:** Mirrored screens use the same per-player size so both monitors share one framing.
+- **DPI scaling:** Monitor and window rects are read and applied in per-monitor DPI-aware physical pixels, so 125%/150% Windows scaling does not offset the output windows. If the game window itself is DPI-unaware, `gothamduo.log` logs a warning (set the game's compatibility DPI override to **Application** or use 100% scaling).
+- **Arrangement:** Left/right, stacked, and negative-coordinate layouts (monitor 2 left of or above monitor 1) are supported; pick monitors with `[Monitors] Player1/Player2`.
+- **Overrides:** `[Display] TargetWidth/TargetHeight` set the combined Duo span (per-player size = width/2 x height); `SoloWidth/SoloHeight` override Solo and mirrored size.
+
+Trade-off: with mixed resolutions the larger monitor shows the game at the smaller monitor's resolution (upscaled).
+
 ## Known limitations (expected)
 
 - Menus, loading screens, cutscenes, and shared-camera scenes auto-mirror at native `1920x1080` across both monitors in Duo mode (`AutoDetect=1` / `F1`), and centered subtitles/HUD banners over split-screen are replicated onto both monitors. Custom off-center widgets that span the seam without symmetric centering may still require per-screen tuning.

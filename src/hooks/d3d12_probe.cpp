@@ -976,7 +976,7 @@ void STDMETHODCALLTYPE HookDrawIndexedInstanced(ID3D12GraphicsCommandList* self,
             const float fw_f = static_cast<float>(fw);
             const float fh_f = static_cast<float>(fh);
             const LONG half_wi = static_cast<LONG>(fw / 2);
-            const bool vp_ok = fw >= 3000 && fh >= 32 && std::fabs(cur_vp.TopLeftX) <= 2.0f &&
+            const bool vp_ok = fw >= 64 && fh >= 32 && std::fabs(cur_vp.TopLeftX) <= 2.0f &&
                                std::fabs(cur_vp.TopLeftY) <= 2.0f && cur_vp.Width >= fw_f - 4.0f &&
                                cur_vp.Height >= fh_f - 4.0f;
             const bool sc_valid = cur_sc.right > cur_sc.left && cur_sc.bottom > cur_sc.top &&
