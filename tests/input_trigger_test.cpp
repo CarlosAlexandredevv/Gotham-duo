@@ -1,4 +1,4 @@
-#include "input_trigger.h"
+#include "input/input_trigger.h"
 
 #include <cstdio>
 #include <cstdlib>

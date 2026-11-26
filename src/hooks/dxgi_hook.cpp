@@ -1,6 +1,6 @@
-#include "dxgi_hook.h"
-#include "d3d12_probe.h"
-#include "dual_output.h"
+#include "hooks/dxgi_hook.h"
+#include "hooks/d3d12_probe.h"
+#include "output/dual_output.h"
 #include "log.h"
 
 #include <MinHook.h>

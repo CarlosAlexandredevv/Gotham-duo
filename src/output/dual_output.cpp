@@ -1,9 +1,9 @@
-#include "dual_output.h"
-#include "d3d12_probe.h"
-#include "duo_resize_guard.h"
-#include "input_trigger.h"
+#include "output/dual_output.h"
+#include "hooks/d3d12_probe.h"
+#include "output/duo_resize_guard.h"
+#include "input/input_trigger.h"
 #include "log.h"
-#include "split_seam_detector.h"
+#include "output/split_seam_detector.h"
 
 #include <dxgi1_5.h>
 #include <wrl/client.h>

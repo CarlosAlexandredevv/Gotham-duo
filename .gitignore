@@ -7,3 +7,5 @@ out/
 *.sln
 *.vcxproj*
 CMakeUserPresets.json
+__pycache__/
+*.py[cod]

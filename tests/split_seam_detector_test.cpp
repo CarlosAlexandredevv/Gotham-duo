@@ -1,4 +1,4 @@
-#include "split_seam_detector.h"
+#include "output/split_seam_detector.h"
 
 #include <cstdint>
 #include <cstdio>
