@@ -2,6 +2,7 @@
 #include "config.h"
 #include "hooks/d3d12_probe.h"
 #include "output/duo_resize_guard.h"
+#include "output/monitor_layout.h"
 #include "output/output_visibility.h"
 #include "input/input_trigger.h"
 #include "log.h"
@@ -153,23 +154,59 @@ LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-RECT ComputeDualSpanRect(const MonitorDesc& p1,
-                         const MonitorDesc& p2,
-                         const DisplayConfig& display) {
-    const LONG left = (std::min)(p1.rect.left, p2.rect.left);
-    const LONG top = (std::min)(p1.rect.top, p2.rect.top);
-    const LONG width = display.target_width > 0 ? static_cast<LONG>(display.target_width)
-                                                : (p1.width() + p2.width());
-    const LONG height = display.target_height > 0 ? static_cast<LONG>(display.target_height)
-                                                  : (std::min)(p1.height(), p2.height());
-    return RECT{left, top, left + width, top + height};
+RECT ToRect(const LayoutRect& r) {
+    return RECT{r.left, r.top, r.right, r.bottom};
 }
 
-RECT ComputeSoloRect(const MonitorDesc& solo, const DisplayConfig& display) {
-    const LONG width = display.solo_width > 0 ? static_cast<LONG>(display.solo_width) : solo.width();
-    const LONG height =
-        display.solo_height > 0 ? static_cast<LONG>(display.solo_height) : solo.height();
-    return RECT{solo.rect.left, solo.rect.top, solo.rect.left + width, solo.rect.top + height};
+LayoutRect ToLayout(const MonitorDesc& m) {
+    return LayoutRect{m.rect.left, m.rect.top, m.rect.right, m.rect.bottom};
+}
+
+/// Switches the calling thread to per-monitor DPI awareness (v2) so monitor/window rects are
+/// physical pixels regardless of the game's own awareness or Windows display scaling.
+class DpiScope {
+public:
+    DpiScope() {
+        using Fn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+        static const Fn fn = reinterpret_cast<Fn>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+        fn_ = reinterpret_cast<void*>(fn);
+        if (fn) {
+            prev_ = fn(reinterpret_cast<DPI_AWARENESS_CONTEXT>(-4));  // PER_MONITOR_AWARE_V2
+        }
+    }
+    ~DpiScope() {
+        using Fn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+        if (fn_ && prev_) {
+            reinterpret_cast<Fn>(fn_)(prev_);
+        }
+    }
+    DpiScope(const DpiScope&) = delete;
+    DpiScope& operator=(const DpiScope&) = delete;
+
+private:
+    void* fn_ = nullptr;
+    DPI_AWARENESS_CONTEXT prev_ = nullptr;
+};
+
+void LogGameDpiAwareness(HWND gh) {
+    using GetCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(HWND);
+    using GetAwFn = DPI_AWARENESS(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto get_ctx =
+        reinterpret_cast<GetCtxFn>(GetProcAddress(user32, "GetWindowDpiAwarenessContext"));
+    const auto get_aw = reinterpret_cast<GetAwFn>(
+        GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext"));
+    if (!get_ctx || !get_aw) {
+        return;
+    }
+    const DPI_AWARENESS aw = get_aw(get_ctx(gh));
+    Log("Game window DPI awareness=%d (0=unaware, 1=system, 2=per-monitor)", static_cast<int>(aw));
+    if (aw == DPI_AWARENESS_UNAWARE) {
+        Log("Config warning: game window is DPI-unaware; at non-100%% Windows scaling the "
+            "backbuffer may not match the monitor size. Set 100%% scaling or override "
+            "compatibility DPI scaling to 'Application' on the game executable.");
+    }
 }
 
 void ResizeGameWindowToRect(HWND gh, const RECT& rect, const char* reason) {
@@ -177,6 +214,7 @@ void ResizeGameWindowToRect(HWND gh, const RECT& rect, const char* reason) {
         return;
     }
 
+    DpiScope dpi;
     const int width = static_cast<int>(rect.right - rect.left);
     const int height = static_cast<int>(rect.bottom - rect.top);
 
@@ -210,12 +248,14 @@ struct DualOutput::Impl {
     MonitorDesc mon_solo{};
     MonitorDesc mon_p1{};
     MonitorDesc mon_p2{};
+    DuoLayout layout{};
     bool has_monitors = false;
 
     HANDLE win_thread = nullptr;
     HANDLE windows_ready_event = nullptr;
     DWORD win_thread_id = 0;
     HWND hwnd[2]{};
+    HWND backdrop[2]{};
     std::atomic<bool> stop_requested{false};
 
     bool pipeline_ready = false;
@@ -296,38 +336,61 @@ struct DualOutput::Impl {
 
     static DWORD WINAPI WindowThreadProc(LPVOID param) {
         auto* self = static_cast<Impl*>(param);
+        DpiScope dpi;
 
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = OutputWndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = L"GothamDuoOutputWindow";
+        wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         RegisterClassExW(&wc);
 
         const MonitorDesc* targets[2] = {&self->mon_p1, &self->mon_p2};
         const wchar_t* titles[2] = {L"Gotham Duo - Player 1", L"Gotham Duo - Player 2"};
+        const DWORD ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 
         for (int i = 0; i < 2; ++i) {
-            const DWORD ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+            const LayoutRect& out = self->layout.out[i];
+            // Black backdrop only when the aspect-fit output doesn't cover the whole monitor.
+            if (!(out == ToLayout(*targets[i]))) {
+                self->backdrop[i] = CreateWindowExW(ex_style,
+                                                    wc.lpszClassName,
+                                                    L"Gotham Duo - Backdrop",
+                                                    WS_POPUP,
+                                                    targets[i]->rect.left,
+                                                    targets[i]->rect.top,
+                                                    targets[i]->width(),
+                                                    targets[i]->height(),
+                                                    nullptr,
+                                                    nullptr,
+                                                    wc.hInstance,
+                                                    &self->game_hwnd);
+            }
             self->hwnd[i] = CreateWindowExW(ex_style,
                                             wc.lpszClassName,
                                             titles[i],
                                             WS_POPUP,
-                                            targets[i]->rect.left,
-                                            targets[i]->rect.top,
-                                            targets[i]->width(),
-                                            targets[i]->height(),
+                                            out.left,
+                                            out.top,
+                                            out.width(),
+                                            out.height(),
                                             nullptr,
                                             nullptr,
                                             wc.hInstance,
                                             &self->game_hwnd);
-            Log("Created output window %d (hidden): hwnd=%p (%ld,%ld %ldx%ld)",
+            Log("Created output window %d (hidden): hwnd=%p (%d,%d %dx%d) monitor=(%ld,%ld %ldx%ld)%s",
                 i + 1,
                 static_cast<void*>(self->hwnd[i]),
+                out.left,
+                out.top,
+                out.width(),
+                out.height(),
                 targets[i]->rect.left,
                 targets[i]->rect.top,
                 targets[i]->width(),
-                targets[i]->height());
+                targets[i]->height(),
+                self->backdrop[i] ? " letterboxed" : "");
         }
 
         t_win_thread_impl = self;
@@ -382,19 +445,21 @@ struct DualOutput::Impl {
             currently_visible = show;
             self->windows_visible.store(show);
             for (int i = 0; i < 2; ++i) {
-                if (!self->hwnd[i]) {
-                    continue;
-                }
-                if (show) {
-                    SetWindowPos(self->hwnd[i],
-                                 HWND_TOPMOST,
-                                 0,
-                                 0,
-                                 0,
-                                 0,
-                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                } else {
-                    ShowWindow(self->hwnd[i], SW_HIDE);
+                for (HWND w : {self->backdrop[i], self->hwnd[i]}) {
+                    if (!w) {
+                        continue;
+                    }
+                    if (show) {
+                        SetWindowPos(w,
+                                     HWND_TOPMOST,
+                                     0,
+                                     0,
+                                     0,
+                                     0,
+                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    } else {
+                        ShowWindow(w, SW_HIDE);
+                    }
                 }
             }
         };
@@ -426,6 +491,10 @@ struct DualOutput::Impl {
             if (self->hwnd[i]) {
                 DestroyWindow(self->hwnd[i]);
                 self->hwnd[i] = nullptr;
+            }
+            if (self->backdrop[i]) {
+                DestroyWindow(self->backdrop[i]);
+                self->backdrop[i] = nullptr;
             }
         }
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
@@ -544,15 +613,13 @@ struct DualOutput::Impl {
             tearing_supported = (allow_tearing == TRUE);
         }
 
-        const MonitorDesc* targets[2] = {&mon_p1, &mon_p2};
         const bool init_mirror = mirror_state.is_mirroring();
 
         for (int i = 0; i < 2; ++i) {
-            const UINT desired_out_w = init_mirror ? desc.Width : (desc.Width / 2);
-            const UINT max_out_w = static_cast<UINT>(targets[i]->width());
-            const UINT max_out_h = static_cast<UINT>(targets[i]->height());
-            const UINT target_out_w = (std::max)(1U, (std::min)(desired_out_w, max_out_w));
-            const UINT target_out_h = (std::max)(1U, (std::min)(desc.Height, max_out_h));
+            // Swapchain matches the game's per-player pixels; DXGI scales it onto the (aspect-fit)
+            // output window, so a smaller/larger monitor never crops the game image.
+            const UINT target_out_w = (std::max)(1U, init_mirror ? desc.Width : (desc.Width / 2));
+            const UINT target_out_h = (std::max)(1U, desc.Height);
 
             DXGI_SWAP_CHAIN_DESC1 out_desc{};
             out_desc.Width = target_out_w;
@@ -625,17 +692,13 @@ struct DualOutput::Impl {
                 if (cur_desc.Format != src_format) {
                     ReleaseD3D12Locked();
                 } else {
-                    const MonitorDesc* targets[2] = {&mon_p1, &mon_p2};
                     const UINT desired_w = is_mirroring ? cur_desc.Width : (cur_desc.Width / 2);
                     bool need_sc_resize = false;
                     UINT target_w[2]{};
                     UINT target_h[2]{};
                     for (int i = 0; i < 2; ++i) {
-                        target_w[i] = (std::max)(
-                            1U, (std::min)(desired_w, static_cast<UINT>(targets[i]->width())));
-                        target_h[i] = (std::max)(
-                            1U,
-                            (std::min)(cur_desc.Height, static_cast<UINT>(targets[i]->height())));
+                        target_w[i] = (std::max)(1U, desired_w);
+                        target_h[i] = (std::max)(1U, cur_desc.Height);
                         if (target_w[i] != out_width[i] || target_h[i] != out_height[i]) {
                             need_sc_resize = true;
                         }
@@ -838,12 +901,33 @@ void DualOutput::Start(HMODULE self_module) {
             impl_->config.display.solo_height);
     }
 
-    const auto monitors = QueryMonitors();
+    const auto monitors = [] {
+        DpiScope dpi;
+        return QueryMonitors();
+    }();
     impl_->has_monitors = SelectTargetMonitors(
         impl_->config.monitors, monitors, impl_->mon_solo, impl_->mon_p1, impl_->mon_p2);
     if (!impl_->has_monitors) {
         return;
     }
+
+    impl_->layout = ComputeDuoLayout(ToLayout(impl_->mon_p1),
+                                     ToLayout(impl_->mon_p2),
+                                     impl_->config.display.target_width,
+                                     impl_->config.display.target_height);
+    Log("Duo layout: per-player %ux%u span=%dx%d out0=(%d,%d %dx%d) out1=(%d,%d %dx%d)",
+        impl_->layout.half_w,
+        impl_->layout.half_h,
+        impl_->layout.span.width(),
+        impl_->layout.span.height(),
+        impl_->layout.out[0].left,
+        impl_->layout.out[0].top,
+        impl_->layout.out[0].width(),
+        impl_->layout.out[0].height(),
+        impl_->layout.out[1].left,
+        impl_->layout.out[1].top,
+        impl_->layout.out[1].width(),
+        impl_->layout.out[1].height());
 
     Log("Gotham Duo starting in SOLO mode (mon_solo=%ls)", impl_->mon_solo.device);
 
@@ -873,6 +957,7 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         if (SUCCEEDED(game_swapchain->GetHwnd(&queried)) && queried) {
             impl_->game_hwnd.store(queried);
             gh = queried;
+            LogGameDpiAwareness(queried);
         }
     }
 
@@ -946,7 +1031,9 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         }
         ResizeGameWindowToRect(
             impl_->game_hwnd.load(),
-            ComputeSoloRect(impl_->mon_solo, impl_->config.display),
+            ToRect(ComputeSoloRect(ToLayout(impl_->mon_solo),
+                                   impl_->config.display.solo_width,
+                                   impl_->config.display.solo_height)),
             "solo");
         Log("Mode switched to SOLO");
     }
@@ -1007,8 +1094,12 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
     }
 
     const RECT target_rect =
-        want_mirror ? ComputeSoloRect(impl_->mon_solo, impl_->config.display)
-                    : ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2, impl_->config.display);
+        want_mirror
+            ? ToRect(ComputeMirrorRect(ToLayout(impl_->mon_solo),
+                                       impl_->layout,
+                                       impl_->config.display.solo_width,
+                                       impl_->config.display.solo_height))
+            : ToRect(impl_->layout.span);
     const UINT expected_w = static_cast<UINT>(target_rect.right - target_rect.left);
     const UINT expected_h = static_cast<UINT>(target_rect.bottom - target_rect.top);
 
@@ -1083,7 +1174,8 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         return;
     }
 
-    SetSubtitleSplitActive(!want_mirror && actual_w >= 3000, actual_w, actual_h);
+    SetSubtitleSplitActive(
+        !want_mirror && actual_w == expected_w && actual_w >= 64, actual_w, actual_h);
     impl_->CopyAndPresent(game_swapchain, game_queue, orig_present, want_mirror);
 
     const bool window_active =
