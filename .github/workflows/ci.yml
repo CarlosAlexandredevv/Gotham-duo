@@ -25,3 +25,7 @@ jobs:
 
       - name: Test (Release)
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Test install script
+        shell: pwsh
+        run: ./scripts/tests/install.tests.ps1
