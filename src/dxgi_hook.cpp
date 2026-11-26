@@ -1,4 +1,5 @@
 #include "dxgi_hook.h"
+#include "d3d12_probe.h"
 #include "dual_output.h"
 #include "log.h"
 
@@ -72,6 +73,7 @@ void TryCaptureGameSwapChain(IUnknown* device_or_queue, IDXGISwapChain* sc, cons
     std::lock_guard<std::mutex> lock(g_state_mtx);
     g_game_swapchain = sc3;
     g_game_queue = queue;
+    gotham::InitD3D12Probe(queue.Get());
     Log("Captured game D3D12 SwapChain=%p Queue=%p via %s (%ux%u fmt=%u)",
         static_cast<void*>(sc3.Get()),
         static_cast<void*>(queue.Get()),
@@ -137,9 +139,23 @@ void HandleGamePresent(IDXGISwapChain* self) {
         return;
     }
 
+    std::optional<gotham::StripClassification> frame_sample;
+    gotham::FrameRenderStats stats{};
+    bool has_stats = false;
+    DXGI_SWAP_CHAIN_DESC1 sc_desc{};
+    if (SUCCEEDED(sc3->GetDesc1(&sc_desc))) {
+        stats = gotham::ConsumeFrameRenderStats(queue.Get(), sc_desc.Width, sc_desc.Height);
+        frame_sample = gotham::ClassifyFrameStats(stats);
+        has_stats = true;
+    }
+
     g_in_internal_create = true;
-    g_dual_output.PresentFrame(sc3.Get(), queue.Get(), g_orig_present);
+    gotham::SetD3D12InternalCall(true);
+    g_dual_output.PresentFrame(
+        sc3.Get(), queue.Get(), g_orig_present, frame_sample, has_stats ? &stats : nullptr);
+    gotham::SetD3D12InternalCall(false);
     g_in_internal_create = false;
+    gotham::TickD3D12ProbeOnPresent(queue.Get(), false);
 
     const uint64_t frame = ++g_frame_count;
     if (frame % 300 == 0) {
@@ -177,9 +193,17 @@ HRESULT STDMETHODCALLTYPE HookResizeBuffers(IDXGISwapChain* self,
             height,
             buffer_count,
             static_cast<unsigned>(new_format));
-        g_dual_output.ResetSwapChains();
+        g_dual_output.OnGameResizeBuffers(new_format);
     }
-    return g_orig_resize_buffers(self, buffer_count, width, height, new_format, swapchain_flags);
+    HRESULT hr =
+        g_orig_resize_buffers(self, buffer_count, width, height, new_format, swapchain_flags);
+    if (FAILED(hr) && is_game) {
+        Log("Game ResizeBuffers retry with full swapchain reset (hr=0x%08X)",
+            static_cast<unsigned>(hr));
+        g_dual_output.ResetSwapChains();
+        hr = g_orig_resize_buffers(self, buffer_count, width, height, new_format, swapchain_flags);
+    }
+    return hr;
 }
 
 LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -192,6 +216,7 @@ struct DummyDxgiVtables {
     void* present = nullptr;
     void* resize_buffers = nullptr;
     void* present1 = nullptr;
+    ComPtr<ID3D12Device> dummy_device;
 };
 
 bool ResolveDxgiVtables(DummyDxgiVtables& out) {
@@ -220,6 +245,7 @@ bool ResolveDxgiVtables(DummyDxgiVtables& out) {
         void** factory_vt = *reinterpret_cast<void***>(factory.Get());
         out.create_swapchain = factory_vt[10];
         out.create_swapchain_hwnd = factory_vt[15];
+        out.dummy_device = device;
 
         D3D12_COMMAND_QUEUE_DESC qdesc{};
         qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -301,6 +327,7 @@ bool InitDxgiHook(HMODULE self_module) {
         return false;
     }
 
+    gotham::InitD3D12ResourceHooks(vt.dummy_device.Get());
     Log("DXGI hooks enabled successfully.");
     return true;
 }

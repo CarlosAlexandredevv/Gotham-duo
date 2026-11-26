@@ -31,7 +31,7 @@ The goal is local co-op only. The game has no online or LAN co-op, and this proj
 - [x] Automatic Solo/Duo mode switching (starts in Solo; switches to Duo on P2 `Start` or `F9`, returns to Solo on `Back + Start` hold or `F9`)
 - [ ] Suppress the original presentation to avoid duplicates
 - [ ] Config file (monitor selection and input triggers via `gothamduo.ini` work; full hotkey/resolution config pending)
-- [ ] Handle menus, pause screen and the shared-camera case (Phase 1: centered menus and shared screens mirror automatically across both monitors in Duo mode, with `F8` manual toggle; Phase 2: centered subtitles/HUD prompts over active split-screen remain pending)
+- [x] Handle menus, pause screen, shared camera, and centered subtitles/HUD prompts (menus, loading screens, cutscenes, and shared-camera scenes auto-switch to native `1920x1080` mirrored across both monitors in Duo mode via structural D3D12 detection with `F1` override; centered subtitles and shared HUD banners over active split-screen are replicated onto each monitor via D3D12 Slate draw replay)
 - [ ] Test on Steam (2-controller co-op) and Epic versions
 
 ## How it works
@@ -86,14 +86,13 @@ Dependencies:
 4. Switching modes:
    - **Solo → Duo:** Press `Start` on Controller 2 (auto-detected) or press `F9`.
    - **Duo → Solo:** Hold `Back + Start` on Controller 2 for `800 ms` (configurable) or press `F9`.
-   - `F8`: Toggle mirrored menu mode manually in Duo mode (overrides auto-detection; press again to return to `Auto`).
-   - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080`) while in Duo mode.
-5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`). Under `[MenuMirror]`, you can configure `AutoDetect` (`1` to auto-mirror centered/shared screens in Duo mode, `0` for manual `F8` only), `EnterMirrorMs` (default `150`), and `ExitMirrorMs` (default `100`).
+   - `F1`: Override mirrored `1920x1080` menu mode manually in Duo mode (press again to return to `Auto`).
+   - `F10`: Re-apply the combined dual-monitor window resize (`3840x1080` or `1920x1080`) while in Duo mode.
+5. Check `gothamduo.log` in `LEGOBatmanLotDK\Binaries\Win64\` for detected monitor indices (`Monitor[0]`, `Monitor[1]`, ...) if you want to override `Player1` / `Player2` in `gothamduo.ini`. Under `[Input]`, you can also configure `AllowControllerToggle` (`1` or `0`), `P2ControllerIndex` (`-1` to watch slots `1..3`, or `0..3` for a specific XInput slot), and `HoldBackStartMs` (default `800`). Under `[MenuMirror]`, you can configure `AutoDetect` (`1` default for structural D3D12 auto-mirroring on menus, loading, and cutscenes; `0` for manual `F1` only), `EnterMirrorMs` (default `200`), and `ExitMirrorMs` (default `100`).
 
 ## Known limitations (expected)
 
-- Centered menus and shared screens now mirror across both monitors in Duo mode (`AutoDetect` / `F8`), while centered subtitles and shared HUD prompts drawn over active split-screen still span the center seam (pending Phase 2).
-- When players are close together, the game may merge back into a shared camera, which would stretch across both monitors.
+- Menus, loading screens, cutscenes, and shared-camera scenes auto-mirror at native `1920x1080` across both monitors in Duo mode (`AutoDetect=1` / `F1`), and centered subtitles/HUD banners over split-screen are replicated onto both monitors. Custom off-center widgets that span the seam without symmetric centering may still require per-screen tuning.
 - Input may be ignored when the game window does not have focus.
 - Audio stays on a single output.
 - Anti-tamper or anti-cheat protection could block hooks. This has not been checked yet.

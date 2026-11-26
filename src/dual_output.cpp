@@ -1,4 +1,5 @@
 #include "dual_output.h"
+#include "d3d12_probe.h"
 #include "duo_resize_guard.h"
 #include "input_trigger.h"
 #include "log.h"
@@ -11,9 +12,11 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -80,10 +83,10 @@ MirrorConfig LoadMirrorConfig(HMODULE self_module) {
 
     cfg.auto_detect = GetPrivateProfileIntW(L"MenuMirror", L"AutoDetect", 1, ini_path) != 0;
     const int enter_ms = static_cast<int>(
-        GetPrivateProfileIntW(L"MenuMirror", L"EnterMirrorMs", 150, ini_path));
+        GetPrivateProfileIntW(L"MenuMirror", L"EnterMirrorMs", 200, ini_path));
     const int exit_ms = static_cast<int>(
         GetPrivateProfileIntW(L"MenuMirror", L"ExitMirrorMs", 100, ini_path));
-    cfg.enter_mirror_ms = static_cast<uint32_t>(enter_ms < 0 ? 150 : enter_ms);
+    cfg.enter_mirror_ms = static_cast<uint32_t>(enter_ms < 0 ? 200 : enter_ms);
     cfg.exit_mirror_ms = static_cast<uint32_t>(exit_ms < 0 ? 100 : exit_ms);
     return cfg;
 }
@@ -216,19 +219,18 @@ void ResizeGameWindowToRect(HWND gh, const RECT& rect, const char* reason) {
     const int width = static_cast<int>(rect.right - rect.left);
     const int height = static_cast<int>(rect.bottom - rect.top);
 
-    LONG_PTR style = GetWindowLongPtrW(gh, GWL_STYLE);
-    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
-    style |= WS_POPUP;
-    SetWindowLongPtrW(gh, GWL_STYLE, style);
+    const LONG_PTR old_style = GetWindowLongPtrW(gh, GWL_STYLE);
+    const LONG_PTR new_style =
+        (old_style &
+         ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) |
+        WS_POPUP;
+    UINT swp_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS;
+    if (new_style != old_style) {
+        SetWindowLongPtrW(gh, GWL_STYLE, new_style);
+        swp_flags |= SWP_FRAMECHANGED;
+    }
 
-    SetWindowPos(gh,
-                 nullptr,
-                 rect.left,
-                 rect.top,
-                 width,
-                 height,
-                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING |
-                     SWP_ASYNCWINDOWPOS);
+    SetWindowPos(gh, nullptr, rect.left, rect.top, width, height, swp_flags);
 
     Log("Requested game window resize (%s): hwnd=%p (%ld,%ld %dx%d)",
         reason ? reason : "",
@@ -263,6 +265,7 @@ struct DualOutput::Impl {
     const char* duo_resize_reason = "duo";
     DuoResizeGuard duo_resize_guard{};
     std::atomic<OutputMode> mode{OutputMode::Solo};
+    std::atomic<bool> has_presented_duo{false};
     InputTrigger input_trigger;
     std::atomic<HWND> game_hwnd{nullptr};
     std::atomic<ULONGLONG> last_present_ms{0};
@@ -281,14 +284,11 @@ struct DualOutput::Impl {
     UINT frame_index = 0;
 
     ComPtr<IDXGISwapChain3> out_swapchain[2];
-    ComPtr<ID3D12Resource> seam_readback[kFrameSlots];
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT seam_footprint{};
-    UINT64 seam_readback_bytes = 0;
-    bool seam_readback_valid[kFrameSlots]{};
-    bool seam_readback_ready = false;
-    bool logged_seam_unsupported = false;
-    bool logged_seam_readback_err = false;
+    UINT out_width[2]{};
+    UINT out_height[2]{};
+    bool pipeline_mirror = false;
     MirrorStateMachine mirror_state;
+    SplitJoinDetector split_join_detector;
 
     void NotifyVisibilityChange() const {
         if (hwnd[0]) {
@@ -343,10 +343,14 @@ struct DualOutput::Impl {
         auto sync_visibility = [&]() {
             const HWND gh = self->game_hwnd.load();
             const ULONGLONG last_ms = self->last_present_ms.load();
+            const HWND fg = GetForegroundWindow();
+            const bool game_focused =
+                (!gh || fg == gh || fg == self->hwnd[0] || fg == self->hwnd[1]);
             const bool game_active =
                 (!gh || (IsWindow(gh) && IsWindowVisible(gh) && !IsIconic(gh))) &&
                 (last_ms == 0 || (GetTickCount64() - last_ms) < 1500);
-            const bool show = (self->mode.load() == OutputMode::Duo) && game_active;
+            const bool show = (self->mode.load() == OutputMode::Duo) &&
+                              self->has_presented_duo.load() && game_active && game_focused;
             if (show == currently_visible) {
                 return;
             }
@@ -406,14 +410,11 @@ struct DualOutput::Impl {
         for (auto& sc : out_swapchain) {
             sc.Reset();
         }
-        for (UINT i = 0; i < kFrameSlots; ++i) {
-            seam_readback[i].Reset();
-            seam_readback_valid[i] = false;
+        for (int i = 0; i < 2; ++i) {
+            out_width[i] = 0;
+            out_height[i] = 0;
         }
-        seam_footprint = {};
-        seam_readback_bytes = 0;
-        seam_readback_ready = false;
-        logged_seam_readback_err = false;
+        pipeline_mirror = false;
         cmd_list.Reset();
         for (auto& alloc : allocators) {
             alloc.Reset();
@@ -425,86 +426,12 @@ struct DualOutput::Impl {
         }
         device.Reset();
         pipeline_ready = false;
+        has_presented_duo.store(false);
         tearing_supported = false;
         logged_runtime_err = false;
         src_width = 0;
         src_height = 0;
         src_format = DXGI_FORMAT_UNKNOWN;
-    }
-
-    void InitSeamReadbackLocked(const DXGI_SWAP_CHAIN_DESC1& desc) {
-        seam_readback_ready = false;
-        for (UINT i = 0; i < kFrameSlots; ++i) {
-            seam_readback[i].Reset();
-            seam_readback_valid[i] = false;
-        }
-        if (!mirror_state.config().auto_detect) {
-            return;
-        }
-        if (desc.Width < kSeamStripWidth) {
-            return;
-        }
-        if (!IsSupportedSeamFormat(desc.Format)) {
-            if (!logged_seam_unsupported) {
-                logged_seam_unsupported = true;
-                Log("MenuMirror auto-detect disabled: unsupported DXGI_FORMAT %u (use F8 manual toggle).",
-                    static_cast<unsigned>(desc.Format));
-            }
-            return;
-        }
-
-        D3D12_RESOURCE_DESC strip_desc{};
-        strip_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        strip_desc.Width = kSeamStripWidth;
-        strip_desc.Height = desc.Height;
-        strip_desc.DepthOrArraySize = 1;
-        strip_desc.MipLevels = 1;
-        strip_desc.Format = desc.Format;
-        strip_desc.SampleDesc.Count = 1;
-        strip_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-        UINT64 total_bytes = 0;
-        device->GetCopyableFootprints(&strip_desc, 0, 1, 0, &footprint, nullptr, nullptr, &total_bytes);
-        if (total_bytes == 0 || total_bytes == UINT64_MAX) {
-            return;
-        }
-
-        D3D12_HEAP_PROPERTIES rb_heap{};
-        rb_heap.Type = D3D12_HEAP_TYPE_READBACK;
-
-        D3D12_RESOURCE_DESC rb_desc{};
-        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rb_desc.Width = total_bytes;
-        rb_desc.Height = 1;
-        rb_desc.DepthOrArraySize = 1;
-        rb_desc.MipLevels = 1;
-        rb_desc.Format = DXGI_FORMAT_UNKNOWN;
-        rb_desc.SampleDesc.Count = 1;
-        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-        for (UINT i = 0; i < kFrameSlots; ++i) {
-            const HRESULT hr = device->CreateCommittedResource(
-                &rb_heap,
-                D3D12_HEAP_FLAG_NONE,
-                &rb_desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr,
-                IID_PPV_ARGS(&seam_readback[i]));
-            if (FAILED(hr)) {
-                Log("MenuMirror readback alloc[%u] failed (hr=0x%08X); falling back to F8 manual toggle.",
-                    i,
-                    static_cast<unsigned>(hr));
-                for (auto& rb : seam_readback) {
-                    rb.Reset();
-                }
-                return;
-            }
-        }
-
-        seam_footprint = footprint;
-        seam_readback_bytes = total_bytes;
-        seam_readback_ready = true;
     }
 
     bool InitD3D12Locked(IDXGISwapChain3* game_swapchain, ID3D12CommandQueue* game_queue) {
@@ -573,18 +500,27 @@ struct DualOutput::Impl {
             tearing_supported = (allow_tearing == TRUE);
         }
 
-        DXGI_SWAP_CHAIN_DESC1 out_desc{};
-        out_desc.Width = desc.Width / 2;
-        out_desc.Height = desc.Height;
-        out_desc.Format = desc.Format;
-        out_desc.SampleDesc.Count = 1;
-        out_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        out_desc.BufferCount = kOutputBuffers;
-        out_desc.Scaling = DXGI_SCALING_STRETCH;
-        out_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        out_desc.Flags = tearing_supported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+        const MonitorDesc* targets[2] = {&mon_p1, &mon_p2};
+        const bool init_mirror = mirror_state.is_mirroring();
 
         for (int i = 0; i < 2; ++i) {
+            const UINT desired_out_w = init_mirror ? desc.Width : (desc.Width / 2);
+            const UINT max_out_w = static_cast<UINT>(targets[i]->width());
+            const UINT max_out_h = static_cast<UINT>(targets[i]->height());
+            const UINT target_out_w = (std::max)(1U, (std::min)(desired_out_w, max_out_w));
+            const UINT target_out_h = (std::max)(1U, (std::min)(desc.Height, max_out_h));
+
+            DXGI_SWAP_CHAIN_DESC1 out_desc{};
+            out_desc.Width = target_out_w;
+            out_desc.Height = target_out_h;
+            out_desc.Format = desc.Format;
+            out_desc.SampleDesc.Count = 1;
+            out_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            out_desc.BufferCount = kOutputBuffers;
+            out_desc.Scaling = DXGI_SCALING_STRETCH;
+            out_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            out_desc.Flags = tearing_supported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
             ComPtr<IDXGISwapChain1> sc1;
             HRESULT hr = factory->CreateSwapChainForHwnd(
                 game_queue, hwnd[i], &out_desc, nullptr, nullptr, &sc1);
@@ -598,66 +534,33 @@ struct DualOutput::Impl {
                 ReleaseD3D12Locked();
                 return false;
             }
+            out_width[i] = target_out_w;
+            out_height[i] = target_out_h;
             factory->MakeWindowAssociation(hwnd[i], DXGI_MWA_NO_ALT_ENTER);
         }
 
-        InitSeamReadbackLocked(desc);
+        pipeline_mirror = init_mirror;
         src_width = desc.Width;
         src_height = desc.Height;
         src_format = desc.Format;
         pipeline_ready = true;
-        Log("DualOutput D3D12 pipeline ready: game=%ux%u fmt=%u -> each output=%ux%u tearing=%d",
+        Log("DualOutput D3D12 pipeline ready: game=%ux%u fmt=%u mirror=%d -> out0=%ux%u out1=%ux%u tearing=%d",
             src_width,
             src_height,
             static_cast<unsigned>(src_format),
-            out_desc.Width,
-            out_desc.Height,
+            init_mirror ? 1 : 0,
+            out_width[0],
+            out_height[0],
+            out_width[1],
+            out_height[1],
             tearing_supported ? 1 : 0);
         return true;
-    }
-
-    MirrorUpdateResult UpdateMirrorFromReadbackLocked(UINT slot,
-                                                      bool slot_gpu_done,
-                                                      bool f8_down,
-                                                      ULONGLONG now_ms) {
-        std::optional<StripClassification> sample;
-        if (slot_gpu_done) {
-            const bool has_readback = seam_readback_valid[slot];
-            seam_readback_valid[slot] = false;
-            if (has_readback && seam_readback_ready && mirror_state.config().auto_detect) {
-                const D3D12_RANGE read_range{0, static_cast<SIZE_T>(seam_readback_bytes)};
-                void* mapped = nullptr;
-                const HRESULT map_hr = seam_readback[slot]->Map(0, &read_range, &mapped);
-                if (SUCCEEDED(map_hr) && mapped) {
-                    sample = ClassifyCenterStrip(mapped,
-                                                 seam_footprint.Footprint.RowPitch,
-                                                 src_height,
-                                                 src_format);
-                    const D3D12_RANGE empty_written{0, 0};
-                    seam_readback[slot]->Unmap(0, &empty_written);
-                } else if (!logged_seam_readback_err) {
-                    logged_seam_readback_err = true;
-                    Log("MenuMirror readback Map failed (hr=0x%08X).",
-                        static_cast<unsigned>(map_hr));
-                }
-            }
-        }
-
-        const MirrorUpdateResult mirror_res =
-            mirror_state.Update(f8_down, sample, static_cast<uint64_t>(now_ms));
-        if (mirror_res.transitioned) {
-            Log("DUO layout: %s (%s)",
-                mirror_res.is_mirroring ? "MIRROR" : "SPLIT",
-                mirror_res.reason);
-        }
-        return mirror_res;
     }
 
     void CopyAndPresent(IDXGISwapChain3* game_swapchain,
                         ID3D12CommandQueue* game_queue,
                         OrigPresentFn orig_present,
-                        bool f8_down,
-                        ULONGLONG now_ms) {
+                        bool is_mirroring) {
         ComPtr<IDXGISwapChain3> sc_out[2];
         ComPtr<ID3D12Device> dev_ref;
         bool tearing = false;
@@ -674,10 +577,63 @@ struct DualOutput::Impl {
                 return;
             }
 
-            if (pipeline_ready &&
-                (cur_desc.Width != src_width || cur_desc.Height != src_height ||
-                 cur_desc.Format != src_format)) {
-                ReleaseD3D12Locked();
+            if (pipeline_ready) {
+                if (cur_desc.Format != src_format) {
+                    ReleaseD3D12Locked();
+                } else {
+                    const MonitorDesc* targets[2] = {&mon_p1, &mon_p2};
+                    const UINT desired_w = is_mirroring ? cur_desc.Width : (cur_desc.Width / 2);
+                    bool need_sc_resize = false;
+                    UINT target_w[2]{};
+                    UINT target_h[2]{};
+                    for (int i = 0; i < 2; ++i) {
+                        target_w[i] = (std::max)(
+                            1U, (std::min)(desired_w, static_cast<UINT>(targets[i]->width())));
+                        target_h[i] = (std::max)(
+                            1U,
+                            (std::min)(cur_desc.Height, static_cast<UINT>(targets[i]->height())));
+                        if (target_w[i] != out_width[i] || target_h[i] != out_height[i]) {
+                            need_sc_resize = true;
+                        }
+                    }
+                    if (need_sc_resize) {
+                        WaitForGpuIdle();
+                        for (UINT s = 0; s < kFrameSlots; ++s) {
+                            if (allocators[s]) {
+                                allocators[s]->Reset();
+                            }
+                            slot_fence_values[s] = 0;
+                        }
+                        const UINT sc_flags =
+                            tearing_supported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+                        bool resize_ok = true;
+                        for (int i = 0; i < 2; ++i) {
+                            if (target_w[i] != out_width[i] || target_h[i] != out_height[i]) {
+                                if (FAILED(out_swapchain[i]->ResizeBuffers(kOutputBuffers,
+                                                                           target_w[i],
+                                                                           target_h[i],
+                                                                           cur_desc.Format,
+                                                                           sc_flags))) {
+                                    resize_ok = false;
+                                    break;
+                                }
+                                out_width[i] = target_w[i];
+                                out_height[i] = target_h[i];
+                            }
+                        }
+                        if (!resize_ok) {
+                            ReleaseD3D12Locked();
+                        } else {
+                            src_width = cur_desc.Width;
+                            src_height = cur_desc.Height;
+                            pipeline_mirror = is_mirroring;
+                        }
+                    } else {
+                        src_width = cur_desc.Width;
+                        src_height = cur_desc.Height;
+                        pipeline_mirror = is_mirroring;
+                    }
+                }
             }
 
             if (!pipeline_ready) {
@@ -694,10 +650,6 @@ struct DualOutput::Impl {
                     WaitForSingleObject(fence_event, 1000);
                 }
             }
-            const bool slot_gpu_done = (wait_val == 0) || (fence->GetCompletedValue() >= wait_val);
-
-            const MirrorUpdateResult mirror_res =
-                UpdateMirrorFromReadbackLocked(slot, slot_gpu_done, f8_down, now_ms);
 
             ComPtr<ID3D12Resource> src_buf;
             ComPtr<ID3D12Resource> dst_buf[2];
@@ -741,40 +693,26 @@ struct DualOutput::Impl {
             cmd_list->ResourceBarrier(3, pre_barriers);
 
             const UINT half_w = src_width / 2;
-            const UINT center_x = (src_width - half_w) / 2;
             D3D12_TEXTURE_COPY_LOCATION src_loc{};
             src_loc.pResource = src_buf.Get();
             src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 
-            const D3D12_BOX split_boxes[2] = {
-                {0, 0, 0, half_w, src_height, 1},
-                {src_width - half_w, 0, 0, src_width, src_height, 1},
-            };
-            const D3D12_BOX mirror_box{center_x, 0, 0, center_x + half_w, src_height, 1};
-            const D3D12_BOX boxes[2] = {
-                mirror_res.is_mirroring ? mirror_box : split_boxes[0],
-                mirror_res.is_mirroring ? mirror_box : split_boxes[1],
-            };
-
             for (int i = 0; i < 2; ++i) {
+                const UINT copy_h = (std::min)(src_height, out_height[i]);
+                D3D12_BOX box{};
+                if (is_mirroring) {
+                    const UINT copy_w = (std::min)(src_width, out_width[i]);
+                    const UINT src_x = (src_width > copy_w) ? ((src_width - copy_w) / 2) : 0;
+                    box = D3D12_BOX{src_x, 0, 0, src_x + copy_w, copy_h, 1};
+                } else {
+                    const UINT copy_w = (std::min)(half_w, out_width[i]);
+                    const UINT src_x = (i == 0) ? 0 : (src_width - copy_w);
+                    box = D3D12_BOX{src_x, 0, 0, src_x + copy_w, copy_h, 1};
+                }
                 D3D12_TEXTURE_COPY_LOCATION dst_loc{};
                 dst_loc.pResource = dst_buf[i].Get();
                 dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &boxes[i]);
-            }
-
-            bool queued_readback = false;
-            if (seam_readback_ready && mirror_state.config().auto_detect && slot_gpu_done) {
-                D3D12_TEXTURE_COPY_LOCATION rb_dst{};
-                rb_dst.pResource = seam_readback[slot].Get();
-                rb_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                rb_dst.PlacedFootprint = seam_footprint;
-
-                const UINT strip_left = half_w - (kSeamStripWidth / 2);
-                const D3D12_BOX strip_box{
-                    strip_left, 0, 0, strip_left + kSeamStripWidth, src_height, 1};
-                cmd_list->CopyTextureRegion(&rb_dst, 0, 0, 0, &src_loc, &strip_box);
-                queued_readback = true;
+                cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &box);
             }
 
             const D3D12_RESOURCE_BARRIER post_barriers[3] = {
@@ -796,11 +734,9 @@ struct DualOutput::Impl {
             game_queue->ExecuteCommandLists(1, lists);
 
             const UINT64 fence_val = next_fence_value++;
-            const bool signaled = SUCCEEDED(game_queue->Signal(fence.Get(), fence_val));
-            if (signaled) {
+            if (SUCCEEDED(game_queue->Signal(fence.Get(), fence_val))) {
                 slot_fence_values[slot] = fence_val;
             }
-            seam_readback_valid[slot] = queued_readback && signaled;
 
             sc_out[0] = out_swapchain[0];
             sc_out[1] = out_swapchain[1];
@@ -824,6 +760,9 @@ struct DualOutput::Impl {
                         dev_ref ? static_cast<unsigned>(dev_ref->GetDeviceRemovedReason()) : 0U);
                 }
             }
+        }
+        if (!has_presented_duo.exchange(true)) {
+            NotifyVisibilityChange();
         }
     }
 };
@@ -857,7 +796,9 @@ void DualOutput::Start(HMODULE self_module) {
 
 void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
                               ID3D12CommandQueue* game_queue,
-                              OrigPresentFn orig_present) {
+                              OrigPresentFn orig_present,
+                              std::optional<StripClassification> frame_sample,
+                              const FrameRenderStats* frame_stats) {
     if (!impl_ || !impl_->has_monitors || !game_swapchain || !game_queue) {
         return;
     }
@@ -880,21 +821,36 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
     std::array<ControllerButtons, 4> slots{};
     PollSystemInput(f9_down, slots);
 
-    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    const ULONGLONG now_ms = GetTickCount64();
+    const bool f1_down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
     const bool is_duo = impl_->mode.load() == OutputMode::Duo;
-    const TriggerAction action =
-        impl_->input_trigger.Update(is_duo, f9_down, slots, GetTickCount64());
+    TriggerAction action =
+        impl_->input_trigger.Update(is_duo, f9_down, slots, now_ms);
+    bool auto_joined = false;
+    if (!is_duo && action == TriggerAction::None) {
+        std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
+        if (impl_->split_join_detector.Update(
+                impl_->mirror_state.config(), frame_sample, static_cast<uint64_t>(now_ms))) {
+            action = TriggerAction::ToggleToDuo;
+            auto_joined = true;
+        }
+    }
     if (action == TriggerAction::ToggleToDuo) {
+        bool start_mirrored = false;
+        {
+            std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
+            start_mirrored = impl_->mirror_state.config().auto_detect &&
+                             frame_sample == StripClassification::Shared;
+            impl_->mirror_state.Reset(f1_down, start_mirrored);
+            impl_->split_join_detector.Reset(false);
+        }
         impl_->mode.store(OutputMode::Duo);
         impl_->pending_duo_resize = true;
         impl_->fullscreen_exit_attempts = 0;
-        impl_->duo_resize_reason = "duo";
+        impl_->duo_resize_reason = start_mirrored ? "duo-mirror" : "duo";
         impl_->duo_resize_guard.Reset();
-        {
-            std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
-            impl_->mirror_state.Reset(f8_down);
-        }
-        Log("Mode switched to DUO");
+        Log("Mode switched to DUO%s",
+            auto_joined ? " (auto-split)" : (start_mirrored ? " (mirror)" : ""));
     } else if (action == TriggerAction::ToggleToSolo) {
         impl_->mode.store(OutputMode::Solo);
         impl_->pending_duo_resize = false;
@@ -907,19 +863,71 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
             impl_->ReleaseD3D12Locked();
             impl_->init_failed = false;
             impl_->mirror_state.Reset(false);
+            impl_->split_join_detector.Reset(true);
         }
         ResizeGameWindowToRect(impl_->game_hwnd.load(), impl_->mon_solo.rect, "solo");
         Log("Mode switched to SOLO");
     }
 
     if (impl_->mode.load() != OutputMode::Duo) {
+        SetSubtitleSplitActive(false, 0, 0);
         return;
     }
 
-    const RECT span_rect = ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
-    const UINT expected_w = static_cast<UINT>(span_rect.right - span_rect.left);
-    const UINT expected_h = static_cast<UINT>(span_rect.bottom - span_rect.top);
-    const ULONGLONG now_ms = GetTickCount64();
+    bool want_mirror = false;
+    bool mirror_transitioned = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
+        const bool has_menu_blur = frame_stats && frame_stats->has_menu_blur_pass;
+        const MirrorUpdateResult mirror_res = impl_->mirror_state.Update(
+            f1_down, frame_sample, static_cast<uint64_t>(now_ms), has_menu_blur);
+        want_mirror = mirror_res.is_mirroring;
+        mirror_transitioned = mirror_res.transitioned;
+        if (mirror_res.transitioned) {
+            if (frame_stats) {
+                std::vector<ViewportDrawSummary> sorted = frame_stats->viewports;
+                std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+                    return a.draws > b.draws;
+                });
+                std::string vp_str;
+                const size_t limit = (std::min)(sorted.size(), static_cast<size_t>(8));
+                for (size_t k = 0; k < limit; ++k) {
+                    char buf[64]{};
+                    std::snprintf(buf,
+                                  sizeof(buf),
+                                  "%s(%d,%d %dx%d d=%u dsv=%d)",
+                                  k == 0 ? "" : " ",
+                                  sorted[k].x,
+                                  sorted[k].y,
+                                  sorted[k].w,
+                                  sorted[k].h,
+                                  sorted[k].draws,
+                                  sorted[k].has_dsv ? 1 : 0);
+                    vp_str += buf;
+                }
+                Log("DUO layout: %s (%s) frame=%ux%u blur=%d vps=[%s]",
+                    want_mirror ? "MIRROR" : "SPLIT",
+                    mirror_res.reason,
+                    frame_stats->frame_width,
+                    frame_stats->frame_height,
+                    frame_stats->has_menu_blur_pass ? 1 : 0,
+                    vp_str.c_str());
+            } else {
+                Log("DUO layout: %s (%s)", want_mirror ? "MIRROR" : "SPLIT", mirror_res.reason);
+            }
+        }
+    }
+    if (mirror_transitioned) {
+        impl_->pending_duo_resize = true;
+        impl_->fullscreen_exit_attempts = 0;
+        impl_->duo_resize_reason = want_mirror ? "duo-mirror" : "duo-split";
+        impl_->duo_resize_guard.Reset();
+    }
+
+    const RECT target_rect =
+        want_mirror ? impl_->mon_solo.rect : ComputeDualSpanRect(impl_->mon_p1, impl_->mon_p2);
+    const UINT expected_w = static_cast<UINT>(target_rect.right - target_rect.left);
+    const UINT expected_h = static_cast<UINT>(target_rect.bottom - target_rect.top);
 
     if (!impl_->pending_duo_resize) {
         const HWND active_gh = impl_->game_hwnd.load();
@@ -930,16 +938,17 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
             bool hit_limit = false;
             if (impl_->duo_resize_guard.ShouldReapply(
                     cur_desc.Width, cur_desc.Height, expected_w, expected_h, now_ms, hit_limit)) {
-                Log("Duo backbuffer mismatch (%ux%u != expected %ux%u); re-applying duo resize (attempt %d/%d)",
+                Log("Duo backbuffer mismatch (%ux%u != expected %ux%u); re-applying %s resize (attempt %d/%d)",
                     cur_desc.Width,
                     cur_desc.Height,
                     expected_w,
                     expected_h,
+                    want_mirror ? "mirror" : "duo",
                     impl_->duo_resize_guard.retry_count,
                     DuoResizeGuard::kMaxRetries);
                 impl_->pending_duo_resize = true;
                 impl_->fullscreen_exit_attempts = 0;
-                impl_->duo_resize_reason = "duo-reapply";
+                impl_->duo_resize_reason = want_mirror ? "duo-mirror-reapply" : "duo-reapply";
             } else if (hit_limit) {
                 Log("Duo backbuffer stayed %ux%u (expected %ux%u) after %d attempts; stopping auto-resize (press F10 to retry).",
                     cur_desc.Width,
@@ -965,7 +974,7 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
         }
         impl_->pending_duo_resize = false;
         impl_->fullscreen_exit_attempts = 0;
-        ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, impl_->duo_resize_reason);
+        ResizeGameWindowToRect(impl_->game_hwnd.load(), target_rect, impl_->duo_resize_reason);
         impl_->duo_resize_guard.NoteResizeRequested(GetTickCount64());
         impl_->NotifyVisibilityChange();
     }
@@ -973,13 +982,54 @@ void DualOutput::PresentFrame(IDXGISwapChain3* game_swapchain,
     if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
         impl_->duo_resize_guard.Reset();
         impl_->duo_resize_guard.NoteResizeRequested(now_ms);
-        ResizeGameWindowToRect(impl_->game_hwnd.load(), span_rect, "duo-manual");
+        ResizeGameWindowToRect(
+            impl_->game_hwnd.load(), target_rect, want_mirror ? "duo-mirror-manual" : "duo-manual");
     }
 
-    impl_->CopyAndPresent(game_swapchain, game_queue, orig_present, f8_down, now_ms);
+    DXGI_SWAP_CHAIN_DESC1 active_desc{};
+    const bool have_active_desc = SUCCEEDED(game_swapchain->GetDesc1(&active_desc));
+    const UINT actual_w = have_active_desc ? active_desc.Width : 0;
+    const UINT actual_h = have_active_desc ? active_desc.Height : 0;
+    const uint64_t check_ms = GetTickCount64();
+    if (have_active_desc && (actual_w != expected_w || actual_h != expected_h) &&
+        impl_->duo_resize_guard.last_resize_ms.has_value() &&
+        check_ms >= *impl_->duo_resize_guard.last_resize_ms &&
+        (check_ms - *impl_->duo_resize_guard.last_resize_ms) < 300) {
+        SetSubtitleSplitActive(false, actual_w, actual_h);
+        return;
+    }
+
+    SetSubtitleSplitActive(!want_mirror && actual_w >= 3000, actual_w, actual_h);
+    impl_->CopyAndPresent(game_swapchain, game_queue, orig_present, want_mirror);
+}
+
+void DualOutput::OnGameResizeBuffers(DXGI_FORMAT new_format) {
+    SetSubtitleSplitActive(false, 0, 0);
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
+    if (!impl_->pipeline_ready) {
+        return;
+    }
+    if (new_format != DXGI_FORMAT_UNKNOWN && new_format != impl_->src_format) {
+        impl_->ReleaseD3D12Locked();
+        impl_->init_failed = false;
+        return;
+    }
+    impl_->WaitForGpuIdle();
+    for (UINT i = 0; i < kFrameSlots; ++i) {
+        if (impl_->allocators[i]) {
+            impl_->allocators[i]->Reset();
+        }
+        impl_->slot_fence_values[i] = 0;
+    }
+    impl_->src_width = 0;
+    impl_->src_height = 0;
 }
 
 void DualOutput::ResetSwapChains() {
+    SetSubtitleSplitActive(false, 0, 0);
     if (impl_) {
         std::lock_guard<std::mutex> lock(impl_->d3d_mtx);
         impl_->ReleaseD3D12Locked();
