@@ -1,0 +1,31 @@
+Gotham Duo - Dual-monitor local co-op mod for LEGO Batman: Legacy of the Dark Knight
+======================================================================================
+
+INSTALL
+-------
+1. Locate the game's shipping binary folder:
+     <Game Install Folder>\LEGOBatmanLotDK\Binaries\Win64\
+   (This folder contains LEGOBatmanLotDK-Win64-Shipping.exe — do NOT extract to the root launcher folder.)
+2. Extract version.dll and gothamduo.ini from this archive into that folder.
+3. Launch the game (Windowed or Borderless mode is recommended).
+
+CONTROLS
+--------
+- Solo -> Duo:        Press Start on Controller 2, or press F9
+- Duo -> Solo:        Hold Back + Start on Controller 2 for 800 ms, or press F9
+- Menu mirror toggle: Press F1 in Duo mode (overrides automatic 1920x1080 mirroring)
+- Re-apply resize:    Press F10 in Duo mode
+
+CONFIGURATION & LOGS
+--------------------
+- Edit gothamduo.ini to customize monitor indices, controller triggers, and menu mirroring.
+- Check gothamduo.log in the same folder for the mod version, detected monitors, and diagnostics.
+
+UNINSTALL
+---------
+Delete these files from LEGOBatmanLotDK\Binaries\Win64\:
+  - version.dll
+  - gothamduo.ini
+  - gothamduo.log (generated at runtime)
+  - INSTALL.txt (if extracted there)
+  - LICENSE (if extracted there)
