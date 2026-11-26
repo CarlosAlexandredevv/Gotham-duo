@@ -20,6 +20,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 add_library(gothamduo SHARED
+    src/d3d12_probe.cpp
     src/dllmain.cpp
     src/dual_output.cpp
     src/dxgi_hook.cpp
